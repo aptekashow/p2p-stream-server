@@ -7,5 +7,6 @@ services:
     env_file: .env
     environment:
       DEFAULT_BUFFER_SECONDS: "10"
+      HLS_CACHE_SECONDS: "60"
     volumes:
       - ./data:/app/data

@@ -79,6 +79,36 @@ def ensure_cache_worker(stream_id: int, session: dict):
         old_task.cancel()
     CACHE_TASKS[stream_id] = asyncio.create_task(cache_stream_loop(stream_id, session))
 
+async def ensure_stream_started(stream_id: int):
+    with connect() as db:
+        row = db.execute(
+            "SELECT infohash FROM streams WHERE id=?", (stream_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Канал не найден")
+
+    async with stream_lock(stream_id):
+        session = ACTIVE_STREAMS.get(stream_id)
+        task = CACHE_TASKS.get(stream_id)
+        if session and task and not task.done():
+            return {"already_running": True}
+
+        if session:
+            old_task = CACHE_TASKS.pop(stream_id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
+                await asyncio.gather(old_task, return_exceptions=True)
+            try:
+                await ace.stop_session(session.get("command_url"))
+            except Exception:
+                pass
+            ACTIVE_STREAMS.pop(stream_id, None)
+
+        result = await create_stream_session(stream_id, row["infohash"])
+        session = ACTIVE_STREAMS[stream_id]
+        ensure_cache_worker(stream_id, session)
+        return result
+
 
 def cleanup_channel_cache(stream_id: int):
     directory = CACHE_ROOT / str(stream_id)
@@ -652,31 +682,27 @@ async def restart_stream(stream_id: int):
 
 @app.post("/api/streams/{stream_id}/start")
 async def start_stream(stream_id: int):
-    with connect() as db:
-        row = db.execute("SELECT infohash FROM streams WHERE id=?", (stream_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Канал не найден")
-    existing = ACTIVE_STREAMS.get(stream_id)
-    if existing:
-        task = CACHE_TASKS.get(stream_id)
-        if task and not task.done():
-            return {"already_running": True, "stream_url": f"/live/{stream_id}/index.m3u8"}
-        await stop_stream_session(stream_id)
     try:
-        async with stream_lock(stream_id):
-            result = await create_stream_session(stream_id, row["infohash"])
-            session = ACTIVE_STREAMS[stream_id]
-        ensure_cache_worker(stream_id, session)
+        result = await ensure_stream_started(stream_id)
         return {**result, "stream_url": f"/live/{stream_id}/index.m3u8"}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Не удалось запустить AceStream: {exc}")
 
 
 @app.get("/live/{stream_id}/index.m3u8", response_class=PlainTextResponse)
 async def live_playlist(stream_id: int):
+    try:
+        await ensure_stream_started(stream_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Не удалось автоматически запустить канал: {exc}")
+
     session = ACTIVE_STREAMS.get(stream_id)
     if not session:
-        raise HTTPException(404, "Поток не запущен. Сначала вызовите POST /api/streams/{id}/start")
+        raise HTTPException(503, "Канал запускается, повторите запрос")
 
     cleanup_channel_cache(stream_id)
     cached = session.get("cached_segments", {})

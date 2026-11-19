@@ -91,6 +91,7 @@ def delayed_playlist(
     buffer_seconds: float,
     cache_seconds: float,
     now: float,
+    stream_id: int,
 ) -> str | None:
     """Build a valid HLS window delayed behind live edge using only complete cached segments."""
     if not playlist_entries or not cached_segments:
@@ -135,5 +136,5 @@ def delayed_playlist(
     for sequence, item in visible:
         output.extend(item.get("tags", ()))
         output.append(item["extinf"])
-        output.append(f"/live/SEGMENT_ID/segment/{sequence}.ts")
+        output.append(f"/live/{stream_id}/segment/{sequence}.ts")
     return "\n".join(output) + "\n"

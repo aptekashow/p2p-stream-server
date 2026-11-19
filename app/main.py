@@ -206,23 +206,23 @@ async def search(
     page: int = Query(0, ge=0),
     page_size: int = Query(50, ge=1, le=200),
 ):
-    pattern = f"%{q.strip()}%"
+    search_term = q.strip()
 
     with connect() as db:
         total = db.execute(
-            "SELECT COUNT(*) FROM streams WHERE name LIKE ?",
-            (pattern,),
+            "SELECT COUNT(*) FROM streams WHERE instr(casefold(name), casefold(?)) > 0",
+            (search_term,),
         ).fetchone()[0]
 
         rows = db.execute(
             """
             SELECT id, name, infohash, categories, availability, status
             FROM streams
-            WHERE name LIKE ?
+            WHERE instr(casefold(name), casefold(?)) > 0
             ORDER BY name COLLATE NOCASE
             LIMIT ? OFFSET ?
             """,
-            (pattern, page_size, page * page_size),
+            (search_term, page_size, page * page_size),
         ).fetchall()
 
     return {

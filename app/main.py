@@ -458,10 +458,10 @@ async function playStream(id){
     activeStreamId = Number(id);
     const url = '/live/'+id+'/index.m3u8';
     video.style.display='block';
+    if(activeHls){ activeHls.destroy(); activeHls=null; }
     video.pause();
     video.removeAttribute('src');
     video.load();
-    if(activeHls){ activeHls.destroy(); activeHls=null; }
     startStreamHeartbeat(id);
     video.muted=true;
     status.textContent='Запуск потока и заполнение буфера...';
@@ -505,6 +505,16 @@ function escapeHtml(value){
 
 async function streamAction(id, action){
     const out=document.querySelector('#active-streams');
+    if(action==='stop' && activeStreamId !== null && Number(activeStreamId)===Number(id)){
+        stopStreamHeartbeat();
+        activeStreamId=null;
+        if(activeHls){ activeHls.destroy(); activeHls=null; }
+        const video=document.querySelector('#stream-player');
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        document.querySelector('#player-status').textContent='Поток остановлен';
+    }
     out.textContent='Выполняется операция...';
     try{
         const r=await fetch('/api/streams/'+id+'/'+action,{method:'POST'});

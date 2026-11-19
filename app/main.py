@@ -164,11 +164,13 @@ def cleanup_all_channel_caches():
 async def cache_cleanup_loop():
     while True:
         now = time.monotonic()
-        idle_streams = [
-            stream_id
-            for stream_id, session in list(ACTIVE_STREAMS.items())
-            if now - session.get("last_access_monotonic", now) > 5
-        ]
+        idle_streams = []
+        for stream_id, session in list(ACTIVE_STREAMS.items()):
+            # HLS-клиент обновляет live-плейлист с интервалом, зависящим
+            # от EXT-X-TARGETDURATION. Не обрываем поток раньше двух таких интервалов.
+            idle_timeout = max(5.0, float(session.get("target_duration", 0) or 0) * 2.0)
+            if now - session.get("last_access_monotonic", now) > idle_timeout:
+                idle_streams.append(stream_id)
         for stream_id in idle_streams:
             try:
                 await stop_stream_session(stream_id)
@@ -216,6 +218,14 @@ async def cache_stream_loop(stream_id: int, session: dict):
                     raise RuntimeError("AceStream вернул пустой HLS-плейлист")
 
                 session["playlist_header"] = header
+                target_duration_line = next(
+                    (line for line in header if line.startswith("#EXT-X-TARGETDURATION:")),
+                    None,
+                )
+                try:
+                    session["target_duration"] = float(target_duration_line.split(":", 1)[1]) if target_duration_line else 0
+                except (TypeError, ValueError):
+                    session["target_duration"] = 0
                 session["playlist_entries"] = [
                     {"sequence": seq, "extinf": extinf, "duration": duration}
                     for seq, extinf, duration, _ in entries

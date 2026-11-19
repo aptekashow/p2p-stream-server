@@ -49,6 +49,7 @@ async def create_stream_session(stream_id: int, infohash: str):
         "last_cache_update": None,
         "last_segment_progress_monotonic": time.monotonic(),
         "last_segment_sequence": None,
+        "last_segment_signature": None,
         "last_error": None,
         "segments": {},
         "cached_segments": {},
@@ -80,6 +81,7 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         failed_session["last_error"] = None
         failed_session["last_segment_progress_monotonic"] = time.monotonic()
         failed_session["last_segment_sequence"] = None
+        failed_session["last_segment_signature"] = None
         failed_session["segments"] = {}
         failed_session["cached_segments"] = {}
         failed_session["playlist_header"] = []
@@ -207,6 +209,7 @@ async def watchdog_loop():
                         "last_error": None,
                         "last_segment_progress_monotonic": time.monotonic(),
                         "last_segment_sequence": None,
+                        "last_segment_signature": None,
                         "segments": {},
                         "cached_segments": {},
                         "playlist_header": [],
@@ -352,9 +355,11 @@ async def cache_stream_loop(stream_id: int, session: dict):
 
                 if entries:
                     newest_sequence = max(entry[0] for entry in entries)
-                    previous_sequence = session.get("last_segment_sequence")
-                    if previous_sequence is None or newest_sequence > previous_sequence:
+                    newest_signature = entries[-1][3]
+                    previous_signature = session.get("last_segment_signature")
+                    if previous_signature != newest_signature:
                         session["last_segment_sequence"] = newest_sequence
+                        session["last_segment_signature"] = newest_signature
                         session["last_segment_progress_monotonic"] = time.monotonic()
                 failures = 0
                 session["consecutive_errors"] = 0

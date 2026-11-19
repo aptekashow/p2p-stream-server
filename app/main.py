@@ -370,7 +370,16 @@ button.danger{background:#b42332}
 </section>
 
 <section>
-<h2>Поиск каналов</h2>
+<h2>Поиск в P2P-сети AceStream</h2>
+<form id="engine-search-form">
+<input id="engine-q" placeholder="Название трансляции" required>
+<button type="submit">Искать в P2P</button>
+</form>
+<div id="engine-search-results" class="small">Введите название для поиска в сети AceStream.</div>
+</section>
+
+<section>
+<h2>Поиск в своём каталоге</h2>
 <form id="f">
 <input id="q" placeholder="Название канала или часть названия" required>
 <button>Искать</button>
@@ -480,6 +489,59 @@ document.querySelector('#f').onsubmit=async e=>{
     }
 };
 
+async function addFoundChannel(index){
+    const item=window.engineSearchResults?.[index];
+    if(!item) return;
+    const out=document.querySelector('#engine-search-results');
+    try{
+        const r=await fetch('/api/streams/import',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                infohash:item.infohash,
+                name:item.name,
+                categories:item.categories || [],
+                availability:item.availability || 0,
+                status:item.status || 0
+            })
+        });
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        out.textContent='Добавлено в каталог: '+item.name;
+    }catch(e){
+        out.textContent='Ошибка добавления: '+e;
+    }
+}
+
+document.querySelector('#engine-search-form').onsubmit=async e=>{
+    e.preventDefault();
+    const out=document.querySelector('#engine-search-results');
+    out.textContent='Ищем трансляции в P2P-сети...';
+    try{
+        const params=new URLSearchParams({
+            q:document.querySelector('#engine-q').value,
+            page:'0',
+            page_size:'50'
+        });
+        const r=await fetch('/api/engine/search?'+params);
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        window.engineSearchResults=data.results || [];
+        if(!window.engineSearchResults.length){
+            out.textContent='В P2P-сети ничего не найдено.';
+            return;
+        }
+        out.innerHTML='<p>Найдено: '+data.total+'</p>'+window.engineSearchResults.map((item,i)=>
+            '<div class="stream-item"><strong>'+escapeHtml(item.name)+'</strong>'+
+            '<div class="small">Доступность: '+Math.round((item.availability || 0)*100)+'% · статус: '+item.status+
+            ' · '+escapeHtml((item.categories || []).join(', '))+'</div>'+
+            '<div class="stream-actions"><button type="button" onclick="addFoundChannel('+i+')">Добавить в каталог</button></div></div>'
+        ).join('');
+    }catch(e){
+        out.textContent='Ошибка поиска: '+e;
+    }
+};
+
 document.querySelector('#refresh-streams').onclick=loadActiveStreams;
 health();
 loadActiveStreams();
@@ -495,6 +557,45 @@ async def health():
         return {"ok": True, "engine": await ace.health()}
     except Exception as exc:
         return {"ok": False, "engine_error": str(exc)}
+
+
+@app.get("/api/engine/search")
+async def engine_search(
+    q: str = Query(min_length=1, max_length=200),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    try:
+        payload = await ace.search(q.strip(), page=page, page_size=page_size)
+        result = payload.get("result") or payload
+        groups = result.get("results", [])
+        found = []
+        for group in groups:
+            items = group.get("items") if isinstance(group, dict) else None
+            candidates = items if isinstance(items, list) else [group]
+            for item in candidates:
+                if not isinstance(item, dict) or not re.fullmatch(
+                    r"[a-fA-F0-9]{40}", str(item.get("infohash", ""))
+                ):
+                    continue
+                found.append({
+                    "infohash": item["infohash"].lower(),
+                    "name": item.get("name") or group.get("name") or "Без названия",
+                    "categories": item.get("categories") or [],
+                    "availability": item.get("availability") or 0,
+                    "status": item.get("status") or 0,
+                })
+        return {
+            "query": q,
+            "total": result.get("total", len(found)),
+            "page": page,
+            "page_size": page_size,
+            "results": found,
+        }
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Ошибка обращения к поиску AceStream: {exc}")
+    except Exception as exc:
+        raise HTTPException(502, f"Ошибка поиска AceStream: {exc}")
 
 
 @app.post("/api/catalog/import")

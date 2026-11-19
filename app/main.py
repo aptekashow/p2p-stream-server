@@ -5,6 +5,9 @@ import re
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from urllib.parse import urljoin, urlparse
+import hashlib
+import time
 import httpx
 
 from app.config import settings
@@ -15,8 +18,10 @@ from app.db import connect, init_db
 
 ace = AceStreamClient()
 PLAYLIST_PATH = Path("/app/data/ace-stream-playlist.m3u8")
+CACHE_ROOT = Path("/app/data/hls-cache")
 ACTIVE_STREAMS = {}
 STREAM_LOCKS = {}
+CACHE_TASKS = {}
 
 
 def stream_lock(stream_id: int):
@@ -34,6 +39,8 @@ async def create_stream_session(stream_id: int, infohash: str):
         "infohash": infohash,
         "playback_url": playback_url,
         "segments": {},
+        "cached_segments": {},
+        "playlist_header": [],
         "recoveries": recoveries,
     }
     return result
@@ -48,20 +55,123 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         playback_url = (result.get("response") or {}).get("playback_url")
         if not playback_url:
             raise RuntimeError(f"AceStream не вернул playback_url при восстановлении: {result}")
-        recovered = {
-            "infohash": failed_session["infohash"],
-            "playback_url": playback_url,
-            "segments": {},
-            "recoveries": failed_session.get("recoveries", 0) + 1,
+        failed_session["playback_url"] = playback_url
+        failed_session["segments"] = {}
+        failed_session["playlist_header"] = []
+        failed_session["recoveries"] = failed_session.get("recoveries", 0) + 1
+        return failed_session
+
+
+def ensure_cache_worker(stream_id: int, session: dict):
+    old_task = CACHE_TASKS.get(stream_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    CACHE_TASKS[stream_id] = asyncio.create_task(cache_stream_loop(stream_id, session))
+
+
+def cleanup_channel_cache(stream_id: int):
+    directory = CACHE_ROOT / str(stream_id)
+    if not directory.exists():
+        return
+    cutoff = time.time() - settings.hls_cache_seconds
+    for path in directory.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    session = ACTIVE_STREAMS.get(stream_id)
+    if session:
+        cached = session.get("cached_segments", {})
+        session["cached_segments"] = {
+            seq: item for seq, item in cached.items()
+            if Path(item["path"]).is_file()
+            and Path(item["path"]).stat().st_mtime >= cutoff
         }
-        ACTIVE_STREAMS[stream_id] = recovered
-        return recovered
+
+
+async def cache_stream_loop(stream_id: int, session: dict):
+    directory = CACHE_ROOT / str(stream_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    while ACTIVE_STREAMS.get(stream_id) is session:
+        cleanup_channel_cache(stream_id)
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(session["playback_url"])
+                response.raise_for_status()
+                header, entries, pending_extinf = [], [], None
+                for raw_line in response.text.splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("#EXTINF:"):
+                        pending_extinf = line
+                    elif line.startswith("#"):
+                        if pending_extinf is None and not entries:
+                            header.append(line)
+                    elif pending_extinf:
+                        source_url = urljoin(session["playback_url"], line)
+                        match = re.search(r"/(\\d+)\\.ts$", urlparse(source_url).path)
+                        if not match:
+                            continue
+                        duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)
+                        duration = float(duration_match.group(1)) if duration_match else 0.0
+                        entries.append((int(match.group(1)), pending_extinf, duration, source_url))
+                        pending_extinf = None
+                if entries:
+                    session["playlist_header"] = header
+                    semaphore = asyncio.Semaphore(4)
+
+                    async def download_entry(entry):
+                        sequence, extinf, duration, source_url = entry
+                        digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
+                        path = directory / f"{sequence}-{digest}.ts"
+                        cached = session.setdefault("cached_segments", {}).get(sequence)
+                        if cached and Path(cached["path"]).is_file():
+                            return None
+                        async with semaphore:
+                            segment_response = await client.get(source_url)
+                            segment_response.raise_for_status()
+                            temporary = path.with_suffix(".ts.tmp")
+                            await asyncio.to_thread(temporary.write_bytes, segment_response.content)
+                            await asyncio.to_thread(temporary.replace, path)
+                        return sequence, {
+                            "path": str(path),
+                            "extinf": extinf,
+                            "duration": duration,
+                            "cached_at": time.time(),
+                        }
+
+                    results = await asyncio.gather(
+                        *(download_entry(entry) for entry in entries),
+                        return_exceptions=True,
+                    )
+                    cached_segments = session.setdefault("cached_segments", {})
+                    for result in results:
+                        if isinstance(result, tuple):
+                            cached_segments[result[0]] = result[1]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            try:
+                await recover_stream_session(stream_id, session)
+            except Exception:
+                pass
+        cleanup_channel_cache(stream_id)
+        await asyncio.sleep(settings.hls_cache_poll_seconds)
 
 
 @asynccontextmanager
 async def lifespan(app):
     init_db()
-    yield
+    try:
+        yield
+    finally:
+        tasks = list(CACHE_TASKS.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(
@@ -346,6 +456,8 @@ async def start_stream(stream_id: int):
     try:
         async with stream_lock(stream_id):
             result = await create_stream_session(stream_id, row["infohash"])
+            session = ACTIVE_STREAMS[stream_id]
+        ensure_cache_worker(stream_id, session)
         return {**result, "stream_url": f"/live/{stream_id}/index.m3u8"}
     except Exception as exc:
         raise HTTPException(502, f"Не удалось запустить AceStream: {exc}")
@@ -356,73 +468,49 @@ async def live_playlist(stream_id: int):
     session = ACTIVE_STREAMS.get(stream_id)
     if not session:
         raise HTTPException(404, "Поток не запущен. Сначала вызовите POST /api/streams/{id}/start")
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            upstream = await client.get(session["playback_url"])
-            upstream.raise_for_status()
-    except httpx.HTTPError as first_error:
-        try:
-            session = await recover_stream_session(stream_id, session)
-            if not session:
-                raise RuntimeError("Сессия потока отсутствует после восстановления")
-            async with httpx.AsyncClient(timeout=15) as client:
-                upstream = await client.get(session["playback_url"])
-                upstream.raise_for_status()
-        except Exception as recovery_error:
-            raise HTTPException(
-                502,
-                f"Плейлист AceStream недоступен; автоматическое восстановление не удалось. "
-                f"Первичная ошибка: {first_error}; ошибка восстановления: {recovery_error}",
-            )
 
-    header, entries, pending_extinf = [], [], None
-    for raw_line in upstream.text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("#EXTINF:"):
-            pending_extinf = line
-        elif line.startswith("#"):
-            if not entries:
-                header.append(line)
-        elif pending_extinf:
-            match = re.search(r"^(?:https?://[^/]+)?/hls/c/.+/(\d+)\.ts(?:\?.*)?$", line)
-            if not match:
-                raise HTTPException(502, f"Неизвестный адрес HLS-сегмента: {line}")
-            sequence = int(match.group(1))
-            duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)
-            duration = float(duration_match.group(1)) if duration_match else 0.0
-            entries.append((pending_extinf, sequence, duration, line))
-            pending_extinf = None
-
+    cleanup_channel_cache(stream_id)
+    cached = session.get("cached_segments", {})
+    entries = [
+        (sequence, item)
+        for sequence, item in sorted(cached.items())
+        if Path(item["path"]).is_file()
+    ]
     if len(entries) < 3:
-        raise HTTPException(503, "AceStream пока не подготовил достаточно HLS-сегментов")
+        raise HTTPException(503, "Кэш ещё накапливает HLS-сегменты")
 
-    removed_duration, keep_count = 0.0, len(entries)
-    while keep_count > 3 and removed_duration < settings.default_buffer_seconds:
-        keep_count -= 1
-        removed_duration += entries[keep_count][2]
+    # Убираем самые новые сегменты из выдачи, сохраняя задержку относительно live edge.
+    visible = list(entries)
+    removed_duration = 0.0
+    while len(visible) > 3 and removed_duration < settings.default_buffer_seconds:
+        _, newest = visible.pop()
+        removed_duration += newest["duration"]
     if removed_duration < settings.default_buffer_seconds:
-        raise HTTPException(503, f"Ожидание накопления {settings.default_buffer_seconds}-секундного буфера")
+        raise HTTPException(
+            503,
+            f"Ожидание накопления {settings.default_buffer_seconds}-секундного буфера",
+        )
 
-    kept_entries = entries[:keep_count]
-    first_sequence = kept_entries[0][1]
-    session["segments"].update({seq: url for _, seq, _, url in kept_entries})
-    session["segments"] = {seq: url for seq, url in session["segments"].items() if seq >= first_sequence}
-
-    output, media_sequence_updated = [], False
-    for line in header:
+    first_sequence = visible[0][0]
+    output = []
+    media_sequence_written = False
+    for line in session.get("playlist_header", []):
         if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
             output.append(f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
-            media_sequence_updated = True
+            media_sequence_written = True
         else:
             output.append(line)
-    if not media_sequence_updated:
-        output.insert(1, f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
-    for extinf, sequence, _, _ in kept_entries:
-        output.extend((extinf, f"/live/{stream_id}/segment/{sequence}.ts"))
+    if not media_sequence_written:
+        output.insert(1 if output else 0, f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
 
-    return PlainTextResponse("\n".join(output) + "\n", media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+    for sequence, item in visible:
+        output.extend((item["extinf"], f"/live/{stream_id}/segment/{sequence}.ts"))
+
+    return PlainTextResponse(
+        "\\n".join(output) + "\\n",
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/live/{stream_id}/segment/{sequence}.ts")
@@ -430,25 +518,20 @@ async def live_segment(stream_id: int, sequence: int):
     session = ACTIVE_STREAMS.get(stream_id)
     if not session:
         raise HTTPException(404, "Поток не запущен")
-    upstream_url = session["segments"].get(sequence)
-    if not upstream_url:
-        raise HTTPException(404, "Сегмент устарел или отсутствует. Обновите HLS-плейлист")
+
+    cleanup_channel_cache(stream_id)
+    item = session.get("cached_segments", {}).get(sequence)
+    if not item:
+        raise HTTPException(404, "Сегмент отсутствует в пятиминутном кэше")
+    path = Path(item["path"])
+    if not path.is_file():
+        raise HTTPException(404, "Срок хранения сегмента истёк")
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
-            upstream = await client.get(upstream_url)
-            upstream.raise_for_status()
-    except httpx.HTTPError as exc:
-        if getattr(exc, "response", None) is not None and exc.response.status_code in (404, 410, 500, 502, 503):
-            try:
-                await recover_stream_session(stream_id, session)
-            except Exception as recovery_error:
-                raise HTTPException(
-                    502,
-                    f"Сегмент недоступен, автоматическое восстановление не удалось: {recovery_error}",
-                )
-            raise HTTPException(
-                503,
-                "P2P-сессия автоматически перезапущена. Обновите HLS-плейлист для продолжения воспроизведения.",
-            )
-        raise HTTPException(502, f"Ошибка получения HLS-сегмента AceStream: {exc}")
-    return Response(content=upstream.content, media_type="video/mp2t", headers={"Cache-Control": "no-store"})
+        content = await asyncio.to_thread(path.read_bytes)
+    except OSError as exc:
+        raise HTTPException(500, f"Не удалось прочитать сегмент кэша: {exc}")
+    return Response(
+        content=content,
+        media_type="video/mp2t",
+        headers={"Cache-Control": "no-store"},
+    )

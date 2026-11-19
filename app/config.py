@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     default_buffer_seconds: int = 30
     hls_segment_seconds: int = 4
     hls_playlist_segments: int = 10
+    hls_cache_seconds: int = 300
+    hls_cache_poll_seconds: float = 1.5
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()

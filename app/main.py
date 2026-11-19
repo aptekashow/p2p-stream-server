@@ -154,7 +154,11 @@ async def cache_stream_loop(stream_id: int, session: dict):
                         digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
                         path = directory / f"{sequence}-{digest}.ts"
                         cached = session.setdefault("cached_segments", {}).get(sequence)
-                        if cached and Path(cached["path"]).is_file():
+                        if (
+                            cached
+                            and cached.get("source_url") == source_url
+                            and Path(cached["path"]).is_file()
+                        ):
                             return None
                         async with semaphore:
                             segment_response = await client.get(source_url)
@@ -166,6 +170,7 @@ async def cache_stream_loop(stream_id: int, session: dict):
                             "path": str(path),
                             "extinf": extinf,
                             "duration": duration,
+                            "source_url": source_url,
                             "cached_at": time.time(),
                         }
 

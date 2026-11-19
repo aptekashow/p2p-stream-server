@@ -46,6 +46,7 @@ async def create_stream_session(stream_id: int, infohash: str):
         "command_url": response_data.get("command_url"),
         "stat_url": response_data.get("stat_url"),
         "started_at": time.time(),
+        "started_monotonic": time.monotonic(),
         "last_access_monotonic": time.monotonic(),
         "last_cache_update": None,
         "last_segment_progress_monotonic": time.monotonic(),
@@ -80,6 +81,7 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         failed_session["command_url"] = response_data.get("command_url")
         failed_session["stat_url"] = response_data.get("stat_url")
         failed_session["last_error"] = None
+        failed_session["started_monotonic"] = time.monotonic()
         failed_session["last_segment_progress_monotonic"] = time.monotonic()
         failed_session["last_segment_sequence"] = None
         failed_session["last_segment_signature"] = None
@@ -142,11 +144,15 @@ def cleanup_channel_cache(stream_id: int):
     session = ACTIVE_STREAMS.get(stream_id)
     if session:
         cached = session.get("cached_segments", {})
-        session["cached_segments"] = {
-            seq: item for seq, item in cached.items()
-            if Path(item["path"]).is_file()
-            and Path(item["path"]).stat().st_mtime >= cutoff
-        }
+        valid = {}
+        for sequence, item in cached.items():
+            path = Path(item["path"])
+            try:
+                if path.is_file() and path.stat().st_mtime >= cutoff:
+                    valid[sequence] = item
+            except OSError:
+                continue
+        session["cached_segments"] = valid
 
 
 def cleanup_all_channel_caches():
@@ -182,8 +188,13 @@ async def watchdog_loop():
                             ensure_cache_worker(stream_id, session)
                 continue
 
-            last_progress = session.get("last_segment_progress_monotonic", time.monotonic())
-            if time.monotonic() - last_progress < 45:
+            now = time.monotonic()
+            if session.get("last_segment_sequence") is None:
+                # Дать Engine время на первичную P2P-буферизацию, не перезапускать старт каждые 45 секунд.
+                if now - session.get("started_monotonic", now) < 120:
+                    continue
+            last_progress = session.get("last_segment_progress_monotonic", now)
+            if now - last_progress < 45:
                 continue
 
             async with stream_lock(stream_id):
@@ -208,6 +219,7 @@ async def watchdog_loop():
                         "command_url": response_data.get("command_url"),
                         "stat_url": response_data.get("stat_url"),
                         "last_error": None,
+                        "started_monotonic": time.monotonic(),
                         "last_segment_progress_monotonic": time.monotonic(),
                         "last_segment_sequence": None,
                         "last_segment_signature": None,

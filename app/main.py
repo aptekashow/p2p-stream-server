@@ -700,31 +700,36 @@ async def live_playlist(stream_id: int):
     except Exception as exc:
         raise HTTPException(502, f"Не удалось автоматически запустить канал: {exc}")
 
-    session = ACTIVE_STREAMS.get(stream_id)
-    if not session:
-        raise HTTPException(503, "Канал запускается, повторите запрос")
+    deadline = time.monotonic() + 30
+    while True:
+        session = ACTIVE_STREAMS.get(stream_id)
+        if not session:
+            raise HTTPException(503, "Сессия канала перезапускается")
 
-    cleanup_channel_cache(stream_id)
-    cached = session.get("cached_segments", {})
-    entries = [
-        (sequence, item)
-        for sequence, item in sorted(cached.items())
-        if Path(item["path"]).is_file()
-    ]
-    if len(entries) < 3:
-        raise HTTPException(503, "Кэш ещё накапливает HLS-сегменты")
+        cleanup_channel_cache(stream_id)
+        cached = session.get("cached_segments", {})
+        entries = [
+            (sequence, item)
+            for sequence, item in sorted(cached.items())
+            if Path(item["path"]).is_file()
+        ]
 
-    # Убираем самые новые сегменты из выдачи, сохраняя задержку относительно live edge.
-    visible = list(entries)
-    removed_duration = 0.0
-    while len(visible) > 3 and removed_duration < settings.default_buffer_seconds:
-        _, newest = visible.pop()
-        removed_duration += newest["duration"]
-    if removed_duration < settings.default_buffer_seconds:
-        raise HTTPException(
-            503,
-            f"Ожидание накопления {settings.default_buffer_seconds}-секундного буфера",
-        )
+        # Сохраняем задержку относительно live edge, пока кэш накапливается.
+        visible = list(entries)
+        removed_duration = 0.0
+        while len(visible) > 3 and removed_duration < settings.default_buffer_seconds:
+            _, newest = visible.pop()
+            removed_duration += newest["duration"]
+
+        if len(visible) >= 3 and removed_duration >= settings.default_buffer_seconds:
+            break
+
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                503,
+                f"Буфер {settings.default_buffer_seconds} сек. не готов за 30 секунд; повторите запрос",
+            )
+        await asyncio.sleep(0.5)
 
     first_sequence = visible[0][0]
     output = []

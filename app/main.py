@@ -111,7 +111,7 @@ async def cache_stream_loop(stream_id: int, session: dict):
                             header.append(line)
                     elif pending_extinf:
                         source_url = urljoin(session["playback_url"], line)
-                        match = re.search(r"/(\\d+)\\.ts$", urlparse(source_url).path)
+                        match = re.search(r"/(\d+)\.ts$", urlparse(source_url).path)
                         if not match:
                             continue
                         duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)

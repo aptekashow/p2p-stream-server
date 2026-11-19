@@ -434,15 +434,35 @@ button.danger{background:#b42332}
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 let activeHls = null;
+let activeStreamId = null;
+let streamHeartbeat = null;
+
+function stopStreamHeartbeat(){
+    if(streamHeartbeat){ clearInterval(streamHeartbeat); streamHeartbeat=null; }
+}
+function startStreamHeartbeat(id){
+    stopStreamHeartbeat();
+    const ping=()=>fetch('/live/'+id+'/keepalive',{method:'POST',cache:'no-store'}).catch(()=>{});
+    ping();
+    streamHeartbeat=setInterval(ping,2000);
+}
+
 async function playStream(id){
     const video = document.querySelector('#stream-player');
     const status = document.querySelector('#player-status');
+    const previousId = activeStreamId;
+    stopStreamHeartbeat();
+    if(previousId !== null && Number(previousId) !== Number(id)){
+        try{ await fetch('/api/streams/'+previousId+'/stop',{method:'POST'}); }catch(e){}
+    }
+    activeStreamId = Number(id);
     const url = '/live/'+id+'/index.m3u8';
     video.style.display='block';
     video.pause();
     video.removeAttribute('src');
     video.load();
     if(activeHls){ activeHls.destroy(); activeHls=null; }
+    startStreamHeartbeat(id);
     video.muted=true;
     status.textContent='Запуск потока и заполнение буфера...';
     if(video.canPlayType('application/vnd.apple.mpegurl')){
@@ -470,6 +490,12 @@ async function playStream(id){
         status.textContent='Этот браузер не поддерживает HLS';
     }
 }
+
+const streamVideo=document.querySelector('#stream-player');
+streamVideo.addEventListener('pause',stopStreamHeartbeat);
+streamVideo.addEventListener('play',()=>{
+    if(activeStreamId !== null) startStreamHeartbeat(activeStreamId);
+});
 
 function escapeHtml(value){
     return String(value ?? '').replace(/[&<>"']/g, ch => ({
@@ -852,6 +878,15 @@ async def live_playlist(stream_id: int):
         media_type="application/vnd.apple.mpegurl",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.post("/live/{stream_id}/keepalive")
+async def live_keepalive(stream_id: int):
+    session = ACTIVE_STREAMS.get(stream_id)
+    if not session:
+        raise HTTPException(404, "Поток уже остановлен")
+    session["last_access_monotonic"] = time.monotonic()
+    return {"ok": True}
 
 
 @app.get("/live/{stream_id}/segment/{sequence}.ts")

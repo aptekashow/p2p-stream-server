@@ -168,7 +168,9 @@ async def cache_cleanup_loop():
         for stream_id, session in list(ACTIVE_STREAMS.items()):
             # HLS-клиент обновляет live-плейлист с интервалом, зависящим
             # от EXT-X-TARGETDURATION. Не обрываем поток раньше двух таких интервалов.
-            idle_timeout = max(5.0, float(session.get("target_duration", 0) or 0) * 2.0)
+            # VLC обновляет HLS-плейлист не так часто, как браузерный плеер.
+            # Даём клиентам запас времени; после закрытия VLC сессия всё равно остановится.
+            idle_timeout = max(60.0, float(session.get("target_duration", 0) or 0) * 4.0)
             if now - session.get("last_access_monotonic", now) > idle_timeout:
                 idle_streams.append(stream_id)
         for stream_id in idle_streams:
@@ -194,6 +196,7 @@ async def cache_stream_loop(stream_id: int, session: dict):
                 response = await client.get(session["playback_url"])
                 response.raise_for_status()
                 header, entries, pending_extinf = [], [], None
+                media_sequence = 0
                 for raw_line in response.text.splitlines():
                     line = raw_line.strip()
                     if not line:
@@ -201,17 +204,22 @@ async def cache_stream_loop(stream_id: int, session: dict):
                     if line.startswith("#EXTINF:"):
                         pending_extinf = line
                     elif line.startswith("#"):
+                        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                            try:
+                                media_sequence = int(line.split(":", 1)[1])
+                            except ValueError:
+                                media_sequence = 0
                         if pending_extinf is None and not entries:
                             header.append(line)
                     elif pending_extinf:
                         source_url = urljoin(session["playback_url"], line)
-                        match = re.search(r"(?:^|/)(?:segment[_-]?)?(\d+)\.ts$", urlparse(source_url).path, re.IGNORECASE)
-                        if not match:
-                            pending_extinf = None
-                            continue
+                        match = re.search(r"(?:^|/)(?:segment[_-]?)?(\d+)(?:\.ts)?$", urlparse(source_url).path, re.IGNORECASE)
+                        # Не привязываемся к имени файла: некоторые версии Engine
+                        # выдают сегменты с произвольными именами или без номера.
+                        sequence = int(match.group(1)) if match else media_sequence + len(entries)
                         duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)
                         duration = float(duration_match.group(1)) if duration_match else 0.0
-                        entries.append((int(match.group(1)), pending_extinf, duration, source_url))
+                        entries.append((sequence, pending_extinf, duration, source_url))
                         pending_extinf = None
 
                 if not entries:

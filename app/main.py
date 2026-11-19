@@ -330,8 +330,9 @@ async def cache_stream_loop(stream_id: int, session: dict):
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 newest = parsed.segments[-1]
-                if session.get("last_segment_signature") != newest.uri:
-                    session["last_segment_signature"] = newest.uri
+                newest_signature = f"{newest.sequence}|{newest.uri}"
+                if session.get("last_segment_signature") != newest_signature:
+                    session["last_segment_signature"] = newest_signature
                     session["last_segment_sequence"] = newest.sequence
                     session["last_segment_progress_monotonic"] = time.monotonic()
 

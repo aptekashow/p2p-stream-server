@@ -23,6 +23,7 @@ ACTIVE_STREAMS = {}
 STREAM_LOCKS = {}
 CACHE_TASKS = {}
 CACHE_CLEANUP_TASK = None
+WATCHDOG_TASK = None
 SEGMENT_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(8)
 
 
@@ -46,6 +47,8 @@ async def create_stream_session(stream_id: int, infohash: str):
         "started_at": time.time(),
         "last_access_monotonic": time.monotonic(),
         "last_cache_update": None,
+        "last_segment_progress_monotonic": time.monotonic(),
+        "last_segment_sequence": None,
         "last_error": None,
         "segments": {},
         "cached_segments": {},
@@ -75,6 +78,8 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         failed_session["command_url"] = response_data.get("command_url")
         failed_session["stat_url"] = response_data.get("stat_url")
         failed_session["last_error"] = None
+        failed_session["last_segment_progress_monotonic"] = time.monotonic()
+        failed_session["last_segment_sequence"] = None
         failed_session["segments"] = {}
         failed_session["cached_segments"] = {}
         failed_session["playlist_header"] = []
@@ -161,6 +166,60 @@ def cleanup_all_channel_caches():
             pass
 
 
+async def watchdog_loop():
+    """Перезапускает задачи и AceStream-сессии, если поток перестал выдавать сегменты."""
+    while True:
+        for stream_id, session in list(ACTIVE_STREAMS.items()):
+            task = CACHE_TASKS.get(stream_id)
+            if task is None or task.done():
+                async with stream_lock(stream_id):
+                    if ACTIVE_STREAMS.get(stream_id) is session:
+                        current_task = CACHE_TASKS.get(stream_id)
+                        if current_task is None or current_task.done():
+                            ensure_cache_worker(stream_id, session)
+                continue
+
+            last_progress = session.get("last_segment_progress_monotonic", time.monotonic())
+            if time.monotonic() - last_progress < 45:
+                continue
+
+            async with stream_lock(stream_id):
+                if ACTIVE_STREAMS.get(stream_id) is not session:
+                    continue
+                old_task = CACHE_TASKS.pop(stream_id, None)
+                if old_task and old_task is not asyncio.current_task() and not old_task.done():
+                    old_task.cancel()
+                    await asyncio.gather(old_task, return_exceptions=True)
+                try:
+                    await ace.stop_session(session.get("command_url"))
+                except Exception:
+                    pass
+                try:
+                    result = await ace.start_hls(session["infohash"])
+                    response_data = result.get("response") or {}
+                    playback_url = response_data.get("playback_url")
+                    if not playback_url:
+                        raise RuntimeError(f"AceStream не вернул playback_url при watchdog-перезапуске: {result}")
+                    session.update({
+                        "playback_url": playback_url,
+                        "command_url": response_data.get("command_url"),
+                        "stat_url": response_data.get("stat_url"),
+                        "last_error": None,
+                        "last_segment_progress_monotonic": time.monotonic(),
+                        "last_segment_sequence": None,
+                        "segments": {},
+                        "cached_segments": {},
+                        "playlist_header": [],
+                        "playlist_entries": [],
+                        "recoveries": session.get("recoveries", 0) + 1,
+                    })
+                    ensure_cache_worker(stream_id, session)
+                except Exception as exc:
+                    session["last_error"] = f"Watchdog: {exc}"
+                    session["last_segment_progress_monotonic"] = time.monotonic()
+        await asyncio.sleep(5)
+
+
 async def cache_cleanup_loop():
     while True:
         now = time.monotonic()
@@ -193,8 +252,25 @@ async def cache_stream_loop(stream_id: int, session: dict):
         while ACTIVE_STREAMS.get(stream_id) is session:
             cleanup_channel_cache(stream_id)
             try:
-                response = await client.get(session["playback_url"])
+                playlist_url = session["playback_url"]
+                response = await client.get(playlist_url)
                 response.raise_for_status()
+                # AceStream иногда отдаёт master playlist вместо media playlist.
+                # Выбираем первый variant и читаем его media playlist.
+                if "#EXT-X-STREAM-INF:" in response.text:
+                    master_lines = [line.strip() for line in response.text.splitlines() if line.strip()]
+                    variant_url = None
+                    for index, line in enumerate(master_lines[:-1]):
+                        if line.startswith("#EXT-X-STREAM-INF:"):
+                            candidate = master_lines[index + 1]
+                            if not candidate.startswith("#"):
+                                variant_url = urljoin(playlist_url, candidate)
+                                break
+                    if not variant_url:
+                        raise RuntimeError("AceStream вернул master playlist без media variant")
+                    playlist_url = variant_url
+                    response = await client.get(playlist_url)
+                    response.raise_for_status()
                 header, entries, pending_extinf = [], [], None
                 media_sequence = 0
                 for raw_line in response.text.splitlines():
@@ -212,7 +288,7 @@ async def cache_stream_loop(stream_id: int, session: dict):
                         if pending_extinf is None and not entries:
                             header.append(line)
                     elif pending_extinf:
-                        source_url = urljoin(session["playback_url"], line)
+                        source_url = urljoin(playlist_url, line)
                         match = re.search(r"(?:^|/)(?:segment[_-]?)?(\d+)(?:\.ts)?$", urlparse(source_url).path, re.IGNORECASE)
                         # Не привязываемся к имени файла: некоторые версии Engine
                         # выдают сегменты с произвольными именами или без номера.
@@ -274,6 +350,12 @@ async def cache_stream_loop(stream_id: int, session: dict):
                             task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
 
+                if entries:
+                    newest_sequence = max(entry[0] for entry in entries)
+                    previous_sequence = session.get("last_segment_sequence")
+                    if previous_sequence is None or newest_sequence > previous_sequence:
+                        session["last_segment_sequence"] = newest_sequence
+                        session["last_segment_progress_monotonic"] = time.monotonic()
                 failures = 0
                 session["consecutive_errors"] = 0
                 session["last_error"] = None
@@ -298,16 +380,19 @@ async def cache_stream_loop(stream_id: int, session: dict):
 
 @asynccontextmanager
 async def lifespan(app):
-    global CACHE_CLEANUP_TASK
+    global CACHE_CLEANUP_TASK, WATCHDOG_TASK
     init_db()
     cleanup_all_channel_caches()
     CACHE_CLEANUP_TASK = asyncio.create_task(cache_cleanup_loop())
+    WATCHDOG_TASK = asyncio.create_task(watchdog_loop())
     try:
         yield
     finally:
         tasks = list(CACHE_TASKS.values())
         if CACHE_CLEANUP_TASK:
             tasks.append(CACHE_CLEANUP_TASK)
+        if WATCHDOG_TASK:
+            tasks.append(WATCHDOG_TASK)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -938,10 +1023,10 @@ async def live_segment(stream_id: int, sequence: int):
     cleanup_channel_cache(stream_id)
     item = session.get("cached_segments", {}).get(sequence)
     if not item:
-        raise HTTPException(404, "Сегмент отсутствует в пятиминутном кэше")
+        raise HTTPException(404, "Сегмент отсутствует в минутном кэше")
     path = Path(item["path"])
     if not path.is_file():
-        raise HTTPException(404, "Срок хранения сегмента истёк")
+        raise HTTPException(404, "Срок хранения сегмента истёк (60 секунд)")
     try:
         content = await asyncio.to_thread(path.read_bytes)
     except OSError as exc:

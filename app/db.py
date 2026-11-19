@@ -8,6 +8,7 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 def connect():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
+    db.create_function("casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
     return db
 
 def init_db():

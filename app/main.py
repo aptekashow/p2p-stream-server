@@ -22,6 +22,7 @@ CACHE_ROOT = Path("/app/data/hls-cache")
 ACTIVE_STREAMS = {}
 STREAM_LOCKS = {}
 CACHE_TASKS = {}
+CACHE_CLEANUP_TASK = None
 
 
 def stream_lock(stream_id: int):
@@ -88,6 +89,32 @@ def cleanup_channel_cache(stream_id: int):
             if Path(item["path"]).is_file()
             and Path(item["path"]).stat().st_mtime >= cutoff
         }
+
+
+def cleanup_all_channel_caches():
+    if not CACHE_ROOT.exists():
+        return
+    cutoff = time.time() - settings.hls_cache_seconds
+    for directory in CACHE_ROOT.iterdir():
+        if not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        except OSError:
+            pass
+
+
+async def cache_cleanup_loop():
+    while True:
+        cleanup_all_channel_caches()
+        await asyncio.sleep(10)
 
 
 async def cache_stream_loop(stream_id: int, session: dict):
@@ -163,11 +190,16 @@ async def cache_stream_loop(stream_id: int, session: dict):
 
 @asynccontextmanager
 async def lifespan(app):
+    global CACHE_CLEANUP_TASK
     init_db()
+    cleanup_all_channel_caches()
+    CACHE_CLEANUP_TASK = asyncio.create_task(cache_cleanup_loop())
     try:
         yield
     finally:
         tasks = list(CACHE_TASKS.values())
+        if CACHE_CLEANUP_TASK:
+            tasks.append(CACHE_CLEANUP_TASK)
         for task in tasks:
             task.cancel()
         if tasks:

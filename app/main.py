@@ -44,6 +44,7 @@ async def create_stream_session(stream_id: int, infohash: str):
         "command_url": response_data.get("command_url"),
         "stat_url": response_data.get("stat_url"),
         "started_at": time.time(),
+        "last_access_monotonic": time.monotonic(),
         "last_cache_update": None,
         "last_error": None,
         "segments": {},
@@ -162,8 +163,19 @@ def cleanup_all_channel_caches():
 
 async def cache_cleanup_loop():
     while True:
+        now = time.monotonic()
+        idle_streams = [
+            stream_id
+            for stream_id, session in list(ACTIVE_STREAMS.items())
+            if now - session.get("last_access_monotonic", now) > 5
+        ]
+        for stream_id in idle_streams:
+            try:
+                await stop_stream_session(stream_id)
+            except Exception:
+                pass
         cleanup_all_channel_caches()
-        await asyncio.sleep(10)
+        await asyncio.sleep(1)
 
 
 async def cache_stream_loop(stream_id: int, session: dict):
@@ -780,12 +792,16 @@ async def live_playlist(stream_id: int):
     except Exception as exc:
         raise HTTPException(502, f"Не удалось автоматически запустить канал: {exc}")
 
+    session = ACTIVE_STREAMS.get(stream_id)
+    if session:
+        session["last_access_monotonic"] = time.monotonic()
     deadline = time.monotonic() + 45
     while True:
         session = ACTIVE_STREAMS.get(stream_id)
         if not session:
             raise HTTPException(503, "Сессия канала перезапускается")
-
+        # Долгий первый запуск тоже считается активным запросом клиента.
+        session["last_access_monotonic"] = time.monotonic()
         cleanup_channel_cache(stream_id)
         playlist_entries = session.get("playlist_entries", [])
         if playlist_entries:
@@ -844,6 +860,7 @@ async def live_segment(stream_id: int, sequence: int):
     if not session:
         raise HTTPException(404, "Поток не запущен")
 
+    session["last_access_monotonic"] = time.monotonic()
     cleanup_channel_cache(stream_id)
     item = session.get("cached_segments", {}).get(sequence)
     if not item:

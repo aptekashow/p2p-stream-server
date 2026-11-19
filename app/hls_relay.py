@@ -102,7 +102,7 @@ def delayed_playlist(
     for entry in reversed(playlist_entries):
         delay += float(entry["duration"])
         if delay >= buffer_seconds:
-            cutoff = int(entry["sequence"])
+            cutoff = int(entry["sequence"]) - 1
             break
     if cutoff is None:
         return None

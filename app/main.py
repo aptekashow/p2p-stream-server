@@ -356,7 +356,10 @@ button.danger{background:#b42332}
 
 <section>
 <h2>Каталог каналов</h2>
+<div class="stream-actions">
 <button id="import">Импортировать каталог</button>
+<a href="/playlist.m3u" download="p2p-stream-playlist.m3u" style="display:inline-block;padding:12px;border-radius:8px;background:#334155;color:white;text-decoration:none">Скачать весь плейлист</a>
+</div>
 <p id="import-result" class="small">Каталог ещё не импортирован.</p>
 </section>
 

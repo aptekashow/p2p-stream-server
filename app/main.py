@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 from pathlib import Path
 import re
 
@@ -15,6 +16,46 @@ from app.db import connect, init_db
 ace = AceStreamClient()
 PLAYLIST_PATH = Path("/app/data/ace-stream-playlist.m3u8")
 ACTIVE_STREAMS = {}
+STREAM_LOCKS = {}
+
+
+def stream_lock(stream_id: int):
+    return STREAM_LOCKS.setdefault(stream_id, asyncio.Lock())
+
+
+async def create_stream_session(stream_id: int, infohash: str):
+    result = await ace.start_hls(infohash)
+    playback_url = (result.get("response") or {}).get("playback_url")
+    if not playback_url:
+        raise RuntimeError(f"AceStream не вернул playback_url: {result}")
+    previous = ACTIVE_STREAMS.get(stream_id)
+    recoveries = previous.get("recoveries", 0) if previous else 0
+    ACTIVE_STREAMS[stream_id] = {
+        "infohash": infohash,
+        "playback_url": playback_url,
+        "segments": {},
+        "recoveries": recoveries,
+    }
+    return result
+
+
+async def recover_stream_session(stream_id: int, failed_session: dict):
+    async with stream_lock(stream_id):
+        current = ACTIVE_STREAMS.get(stream_id)
+        if current is not failed_session:
+            return current
+        result = await ace.start_hls(failed_session["infohash"])
+        playback_url = (result.get("response") or {}).get("playback_url")
+        if not playback_url:
+            raise RuntimeError(f"AceStream не вернул playback_url при восстановлении: {result}")
+        recovered = {
+            "infohash": failed_session["infohash"],
+            "playback_url": playback_url,
+            "segments": {},
+            "recoveries": failed_session.get("recoveries", 0) + 1,
+        }
+        ACTIVE_STREAMS[stream_id] = recovered
+        return recovered
 
 
 @asynccontextmanager
@@ -303,14 +344,9 @@ async def start_stream(stream_id: int):
     if not row:
         raise HTTPException(404, "Канал не найден")
     try:
-        result = await ace.start_hls(row["infohash"])
-        playback_url = (result.get("response") or {}).get("playback_url")
-        if not playback_url:
-            raise HTTPException(502, f"AceStream не вернул playback_url: {result}")
-        ACTIVE_STREAMS[stream_id] = {"infohash": row["infohash"], "playback_url": playback_url, "segments": {}}
+        async with stream_lock(stream_id):
+            result = await create_stream_session(stream_id, row["infohash"])
         return {**result, "stream_url": f"/live/{stream_id}/index.m3u8"}
-    except HTTPException:
-        raise
     except Exception as exc:
         raise HTTPException(502, f"Не удалось запустить AceStream: {exc}")
 
@@ -324,8 +360,20 @@ async def live_playlist(stream_id: int):
         async with httpx.AsyncClient(timeout=15) as client:
             upstream = await client.get(session["playback_url"])
             upstream.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Ошибка получения HLS-плейлиста AceStream: {exc}")
+    except httpx.HTTPError as first_error:
+        try:
+            session = await recover_stream_session(stream_id, session)
+            if not session:
+                raise RuntimeError("Сессия потока отсутствует после восстановления")
+            async with httpx.AsyncClient(timeout=15) as client:
+                upstream = await client.get(session["playback_url"])
+                upstream.raise_for_status()
+        except Exception as recovery_error:
+            raise HTTPException(
+                502,
+                f"Плейлист AceStream недоступен; автоматическое восстановление не удалось. "
+                f"Первичная ошибка: {first_error}; ошибка восстановления: {recovery_error}",
+            )
 
     header, entries, pending_extinf = [], [], None
     for raw_line in upstream.text.splitlines():
@@ -390,5 +438,17 @@ async def live_segment(stream_id: int, sequence: int):
             upstream = await client.get(upstream_url)
             upstream.raise_for_status()
     except httpx.HTTPError as exc:
+        if getattr(exc, "response", None) is not None and exc.response.status_code in (404, 410, 500, 502, 503):
+            try:
+                await recover_stream_session(stream_id, session)
+            except Exception as recovery_error:
+                raise HTTPException(
+                    502,
+                    f"Сегмент недоступен, автоматическое восстановление не удалось: {recovery_error}",
+                )
+            raise HTTPException(
+                503,
+                "P2P-сессия автоматически перезапущена. Обновите HLS-плейлист для продолжения воспроизведения.",
+            )
         raise HTTPException(502, f"Ошибка получения HLS-сегмента AceStream: {exc}")
     return Response(content=upstream.content, media_type="video/mp2t", headers={"Cache-Control": "no-store"})

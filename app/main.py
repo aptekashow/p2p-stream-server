@@ -75,6 +75,7 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         failed_session["stat_url"] = response_data.get("stat_url")
         failed_session["last_error"] = None
         failed_session["segments"] = {}
+        failed_session["cached_segments"] = {}
         failed_session["playlist_header"] = []
         failed_session["playlist_entries"] = []
         failed_session["recoveries"] = failed_session.get("recoveries", 0) + 1
@@ -758,7 +759,7 @@ async def live_playlist(stream_id: int):
                     for sequence, item in sorted(cached.items())
                     if sequence < cutoff_sequence and Path(item["path"]).is_file()
                 ]
-                if len(visible) >= 3:
+                if len(visible) >= 2:
                     break
 
         if time.monotonic() >= deadline:

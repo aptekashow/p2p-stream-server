@@ -544,7 +544,7 @@ async def live_playlist(stream_id: int):
         output.extend((item["extinf"], f"/live/{stream_id}/segment/{sequence}.ts"))
 
     return PlainTextResponse(
-        "\\n".join(output) + "\\n",
+        "\n".join(output) + "\n",
         media_type="application/vnd.apple.mpegurl",
         headers={"Cache-Control": "no-store"},
     )

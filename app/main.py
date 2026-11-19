@@ -31,7 +31,8 @@ def stream_lock(stream_id: int):
 
 async def create_stream_session(stream_id: int, infohash: str):
     result = await ace.start_hls(infohash)
-    playback_url = (result.get("response") or {}).get("playback_url")
+    response_data = result.get("response") or {}
+    playback_url = response_data.get("playback_url")
     if not playback_url:
         raise RuntimeError(f"AceStream не вернул playback_url: {result}")
     previous = ACTIVE_STREAMS.get(stream_id)
@@ -39,6 +40,11 @@ async def create_stream_session(stream_id: int, infohash: str):
     ACTIVE_STREAMS[stream_id] = {
         "infohash": infohash,
         "playback_url": playback_url,
+        "command_url": response_data.get("command_url"),
+        "stat_url": response_data.get("stat_url"),
+        "started_at": time.time(),
+        "last_cache_update": None,
+        "last_error": None,
         "segments": {},
         "cached_segments": {},
         "playlist_header": [],
@@ -53,10 +59,14 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         if current is not failed_session:
             return current
         result = await ace.start_hls(failed_session["infohash"])
-        playback_url = (result.get("response") or {}).get("playback_url")
+        response_data = result.get("response") or {}
+        playback_url = response_data.get("playback_url")
         if not playback_url:
             raise RuntimeError(f"AceStream не вернул playback_url при восстановлении: {result}")
         failed_session["playback_url"] = playback_url
+        failed_session["command_url"] = response_data.get("command_url")
+        failed_session["stat_url"] = response_data.get("stat_url")
+        failed_session["last_error"] = None
         failed_session["segments"] = {}
         failed_session["playlist_header"] = []
         failed_session["recoveries"] = failed_session.get("recoveries", 0) + 1
@@ -147,6 +157,8 @@ async def cache_stream_loop(stream_id: int, session: dict):
                         pending_extinf = None
                 if entries:
                     session["playlist_header"] = header
+                    session["last_cache_update"] = time.time()
+                    session["last_error"] = None
                     semaphore = asyncio.Semaphore(4)
 
                     async def download_entry(entry):
@@ -184,11 +196,12 @@ async def cache_stream_loop(stream_id: int, session: dict):
                             cached_segments[result[0]] = result[1]
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            session["last_error"] = str(exc)
             try:
                 await recover_stream_session(stream_id, session)
-            except Exception:
-                pass
+            except Exception as recovery_exc:
+                session["last_error"] = str(recovery_exc)
         cleanup_channel_cache(stream_id)
         await asyncio.sleep(settings.hls_cache_poll_seconds)
 
@@ -298,6 +311,13 @@ input{width:min(100%,420px)}
 button{background:#2563eb;cursor:pointer}
 pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .small{color:#9ba9bd}
+.stream-item{border:1px solid #34445c;border-radius:10px;padding:12px;margin:10px 0}
+.stream-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.stream-actions button{padding:8px 12px}
+button.secondary{background:#334155}
+button.danger{background:#b42332}
+.status-ok{color:#5ee0a0}
+.status-error{color:#ff9b9b}
 </style>
 </head>
 <body>
@@ -311,12 +331,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </section>
 
 <section>
+<h2>Активные каналы</h2>
+<button id="refresh-streams" type="button">Обновить</button>
+<div id="active-streams" class="small">Активных каналов пока нет.</div>
+</section>
+
+<section>
 <h2>Поиск каналов</h2>
 <form id="f">
 <input id="q" placeholder="Название канала или часть названия" required>
 <button>Искать</button>
 </form>
-<pre id="out">Введите запрос.</pre>
+<div id="out">Введите запрос.</div>
 </section>
 
 <section>
@@ -325,6 +351,54 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </section>
 
 <script>
+function escapeHtml(value){
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[ch]));
+}
+
+async function streamAction(id, action){
+    const out=document.querySelector('#active-streams');
+    out.textContent='Выполняется операция...';
+    try{
+        const r=await fetch('/api/streams/'+id+'/'+action,{method:'POST'});
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        await loadActiveStreams();
+    }catch(e){
+        out.textContent='Ошибка: '+e;
+    }
+}
+
+async function loadActiveStreams(){
+    const out=document.querySelector('#active-streams');
+    try{
+        const r=await fetch('/api/streams/status');
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        if(!data.length){
+            out.textContent='Активных каналов пока нет.';
+            return;
+        }
+        out.innerHTML=data.map(item=>{
+            const state=item.status==='running'
+                ? '<span class="status-ok">Работает</span>'
+                : '<span class="status-error">Проблема</span>';
+            const stats=item.peers===null ? 'статистика недоступна'
+                : 'пиров: '+item.peers+' · ↓ '+item.speed_down+' КБ/с · ↑ '+item.speed_up+' КБ/с';
+            const error=item.last_error
+                ? '<div class="status-error">'+escapeHtml(item.last_error)+'</div>' : '';
+            return '<div class="stream-item"><strong>'+escapeHtml(item.name)+'</strong><div>'+state+
+                ' · сегментов в кэше: '+item.cached_segments+' · восстановлений: '+item.recoveries+
+                '</div><div class="small">'+stats+'</div>'+error+
+                '<div class="stream-actions"><button class="danger" onclick="streamAction('+item.id+',\'stop\')">Остановить</button>'+
+                '<button class="secondary" onclick="streamAction('+item.id+',\'restart\')">Перезапустить</button></div></div>';
+        }).join('');
+    }catch(e){
+        out.textContent='Ошибка загрузки статуса: '+e;
+    }
+}
+
 async function health(){
     try{
         let r=await fetch('/api/health');
@@ -355,13 +429,26 @@ document.querySelector('#f').onsubmit=async e=>{
         let r=await fetch('/api/search?q='+encodeURIComponent(
             document.querySelector('#q').value
         ));
-        out.textContent=JSON.stringify(await r.json(),null,2);
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        if(!data.results.length){
+            out.textContent='Ничего не найдено.';
+            return;
+        }
+        out.innerHTML=data.results.map(item=>
+            '<div class="stream-item"><strong>'+escapeHtml(item.name)+'</strong>'+
+            '<div class="small">ID: '+item.id+'</div>'+
+            '<div class="stream-actions"><button onclick="streamAction('+item.id+',\'start\')">Запустить</button></div></div>'
+        ).join('');
     }catch(e){
         out.textContent=String(e);
     }
 };
 
+document.querySelector('#refresh-streams').onclick=loadActiveStreams;
 health();
+loadActiveStreams();
+setInterval(loadActiveStreams,5000);
 </script>
 </body>
 </html>""")
@@ -482,6 +569,83 @@ async def playlist(request: Request):
         ]
 
     return "\n".join(lines) + "\n"
+
+
+async def stop_stream_session(stream_id: int):
+    async with stream_lock(stream_id):
+        session = ACTIVE_STREAMS.get(stream_id)
+        if not session:
+            return {"stopped": False, "message": "Канал уже остановлен"}
+        task = CACHE_TASKS.pop(stream_id, None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        engine_result = None
+        engine_error = None
+        try:
+            engine_result = await ace.stop_session(session.get("command_url"))
+        except Exception as exc:
+            engine_error = str(exc)
+        ACTIVE_STREAMS.pop(stream_id, None)
+        return {
+            "stopped": True,
+            "engine_stopped": engine_error is None,
+            "engine_result": engine_result,
+            "engine_error": engine_error,
+        }
+
+
+@app.get("/api/streams/status")
+async def streams_status():
+    with connect() as db:
+        rows = db.execute("SELECT id, name FROM streams ORDER BY name COLLATE NOCASE").fetchall()
+    active = []
+    for row in rows:
+        stream_id = row["id"]
+        session = ACTIVE_STREAMS.get(stream_id)
+        if not session:
+            continue
+        task = CACHE_TASKS.get(stream_id)
+        stats = {}
+        try:
+            stats = await ace.session_stats(session.get("stat_url"))
+        except Exception:
+            pass
+        active.append({
+            "id": stream_id,
+            "name": row["name"],
+            "status": "running" if task and not task.done() else "error",
+            "peers": stats.get("peers"),
+            "speed_down": stats.get("speed_down", 0),
+            "speed_up": stats.get("speed_up", 0),
+            "cached_segments": len(session.get("cached_segments", {})),
+            "recoveries": session.get("recoveries", 0),
+            "last_cache_update": session.get("last_cache_update"),
+            "last_error": session.get("last_error"),
+        })
+    return active
+
+
+@app.post("/api/streams/{stream_id}/stop")
+async def stop_stream(stream_id: int):
+    return await stop_stream_session(stream_id)
+
+
+@app.post("/api/streams/{stream_id}/restart")
+async def restart_stream(stream_id: int):
+    with connect() as db:
+        row = db.execute("SELECT infohash FROM streams WHERE id=?", (stream_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Канал не найден")
+    await stop_stream_session(stream_id)
+    try:
+        async with stream_lock(stream_id):
+            result = await create_stream_session(stream_id, row["infohash"])
+            session = ACTIVE_STREAMS[stream_id]
+        ensure_cache_worker(stream_id, session)
+        return {**result, "stream_url": f"/live/{stream_id}/index.m3u8"}
+    except Exception as exc:
+        raise HTTPException(502, f"Не удалось перезапустить AceStream: {exc}")
 
 
 @app.post("/api/streams/{stream_id}/start")

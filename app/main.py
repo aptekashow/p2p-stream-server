@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.acestream import AceStreamClient
 from app.db import connect, init_db
+from app.hls_relay import parse_playlist, delayed_playlist
 
 ace = AceStreamClient()
 PLAYLIST_PATH = Path("/app/data/ace-stream-playlist.m3u8")
@@ -245,140 +246,113 @@ async def cache_cleanup_loop():
 
 
 async def cache_stream_loop(stream_id: int, session: dict):
+    """Fetch AceStream HLS continuously and persist complete segments in a 60s ring cache."""
     directory = CACHE_ROOT / str(stream_id)
     directory.mkdir(parents=True, exist_ok=True)
     failures = 0
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=8.0),
+        timeout=httpx.Timeout(30.0, connect=10.0),
         limits=httpx.Limits(max_connections=12, max_keepalive_connections=8),
+        follow_redirects=True,
     ) as client:
         while ACTIVE_STREAMS.get(stream_id) is session:
-            cleanup_channel_cache(stream_id)
             try:
+                cleanup_channel_cache(stream_id)
                 playlist_url = session["playback_url"]
                 response = await client.get(playlist_url)
                 response.raise_for_status()
-                # AceStream иногда отдаёт master playlist вместо media playlist.
-                # Выбираем первый variant и читаем его media playlist.
-                if "#EXT-X-STREAM-INF:" in response.text:
-                    master_lines = [line.strip() for line in response.text.splitlines() if line.strip()]
-                    variant_url = None
-                    for index, line in enumerate(master_lines[:-1]):
-                        if line.startswith("#EXT-X-STREAM-INF:"):
-                            candidate = master_lines[index + 1]
-                            if not candidate.startswith("#"):
-                                variant_url = urljoin(playlist_url, candidate)
-                                break
-                    if not variant_url:
-                        raise RuntimeError("AceStream вернул master playlist без media variant")
-                    playlist_url = variant_url
+                parsed = parse_playlist(response.text, playlist_url)
+                if parsed.variant_url:
+                    playlist_url = parsed.variant_url
                     response = await client.get(playlist_url)
                     response.raise_for_status()
-                header, entries, pending_extinf = [], [], None
-                media_sequence = 0
-                for raw_line in response.text.splitlines():
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("#EXTINF:"):
-                        pending_extinf = line
-                    elif line.startswith("#"):
-                        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                            try:
-                                media_sequence = int(line.split(":", 1)[1])
-                            except ValueError:
-                                media_sequence = 0
-                        if pending_extinf is None and not entries:
-                            header.append(line)
-                    elif pending_extinf:
-                        source_url = urljoin(playlist_url, line)
-                        match = re.search(r"(?:^|/)(?:segment[_-]?)?(\d+)(?:\.ts)?$", urlparse(source_url).path, re.IGNORECASE)
-                        # Не привязываемся к имени файла: некоторые версии Engine
-                        # выдают сегменты с произвольными именами или без номера.
-                        sequence = int(match.group(1)) if match else media_sequence + len(entries)
-                        duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)
-                        duration = float(duration_match.group(1)) if duration_match else 0.0
-                        entries.append((sequence, pending_extinf, duration, source_url))
-                        pending_extinf = None
+                    parsed = parse_playlist(response.text, playlist_url)
+                    if parsed.variant_url:
+                        raise RuntimeError("Вложенные master-плейлисты AceStream не поддерживаются")
 
-                if not entries:
-                    raise RuntimeError("AceStream вернул пустой HLS-плейлист")
-
-                session["playlist_header"] = header
-                target_duration_line = next(
-                    (line for line in header if line.startswith("#EXT-X-TARGETDURATION:")),
-                    None,
-                )
-                try:
-                    session["target_duration"] = float(target_duration_line.split(":", 1)[1]) if target_duration_line else 0
-                except (TypeError, ValueError):
-                    session["target_duration"] = 0
+                session["playlist_header"] = list(parsed.header)
+                session["target_duration"] = parsed.target_duration
                 session["playlist_entries"] = [
-                    {"sequence": seq, "extinf": extinf, "duration": duration}
-                    for seq, extinf, duration, _ in entries
+                    {
+                        "sequence": segment.sequence,
+                        "extinf": segment.extinf,
+                        "duration": segment.duration,
+                        "tags": list(segment.tags),
+                        "source_url": segment.uri,
+                    }
+                    for segment in parsed.segments
                 ]
                 session["last_cache_update"] = time.time()
+
                 semaphore = asyncio.Semaphore(2)
 
-                async def download_entry(entry):
-                    sequence, extinf, duration, source_url = entry
+                async def download_segment(segment):
+                    sequence = segment.sequence
+                    source_url = segment.uri
                     digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
                     path = directory / f"{sequence}-{digest}.ts"
                     cached = session.setdefault("cached_segments", {}).get(sequence)
-                    if cached and cached.get("source_url") == source_url and Path(cached["path"]).is_file():
+                    if (
+                        cached
+                        and cached.get("source_url") == source_url
+                        and Path(cached["path"]).is_file()
+                    ):
                         return None
+
                     async with semaphore, SEGMENT_DOWNLOAD_SEMAPHORE:
                         segment_response = await client.get(source_url)
                         segment_response.raise_for_status()
+                        if not segment_response.content:
+                            raise RuntimeError(f"Пустой HLS-сегмент: {source_url}")
                         temporary = path.with_suffix(".ts.tmp")
                         await asyncio.to_thread(temporary.write_bytes, segment_response.content)
                         await asyncio.to_thread(temporary.replace, path)
+
                     return sequence, {
                         "path": str(path),
-                        "extinf": extinf,
-                        "duration": duration,
+                        "extinf": segment.extinf,
+                        "duration": segment.duration,
+                        "tags": list(segment.tags),
                         "source_url": source_url,
                         "cached_at": time.time(),
                     }
 
-                tasks = [asyncio.create_task(download_entry(entry)) for entry in entries]
+                tasks = [asyncio.create_task(download_segment(segment)) for segment in parsed.segments]
                 try:
                     for completed in asyncio.as_completed(tasks):
-                        result = await completed
-                        if result:
-                            session.setdefault("cached_segments", {})[result[0]] = result[1]
+                        item = await completed
+                        if item:
+                            session["cached_segments"][item[0]] = item[1]
                 finally:
                     for task in tasks:
                         if not task.done():
                             task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
 
-                if entries:
-                    newest_sequence = max(entry[0] for entry in entries)
-                    newest_signature = entries[-1][3]
-                    previous_signature = session.get("last_segment_signature")
-                    if previous_signature != newest_signature:
-                        session["last_segment_sequence"] = newest_sequence
-                        session["last_segment_signature"] = newest_signature
-                        session["last_segment_progress_monotonic"] = time.monotonic()
+                newest = parsed.segments[-1]
+                if session.get("last_segment_signature") != newest.uri:
+                    session["last_segment_signature"] = newest.uri
+                    session["last_segment_sequence"] = newest.sequence
+                    session["last_segment_progress_monotonic"] = time.monotonic()
+
                 failures = 0
                 session["consecutive_errors"] = 0
                 session["last_error"] = None
-                delay = settings.hls_cache_poll_seconds
+                delay = max(0.5, min(settings.hls_cache_poll_seconds, parsed.target_duration / 2 or 1.5))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 failures += 1
                 session["consecutive_errors"] = failures
                 session["last_error"] = str(exc)
-                delay = min(30, 2 ** min(failures, 5))
+                delay = min(15, 2 ** min(failures, 4))
                 if failures >= 4:
                     try:
                         await recover_stream_session(stream_id, session)
                         failures = 0
                         session["consecutive_errors"] = 0
                     except Exception as recovery_exc:
-                        session["last_error"] = f"{exc}; восстановление: {recovery_exc}"
+                        session["last_error"] = f"{exc}; ошибка восстановления AceStream: {recovery_exc}"
             cleanup_channel_cache(stream_id)
             await asyncio.sleep(delay)
 
@@ -947,66 +921,38 @@ async def live_playlist(stream_id: int):
     except Exception as exc:
         raise HTTPException(502, f"Не удалось автоматически запустить канал: {exc}")
 
-    session = ACTIVE_STREAMS.get(stream_id)
-    if session:
-        session["last_access_monotonic"] = time.monotonic()
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + 60
     while True:
         session = ACTIVE_STREAMS.get(stream_id)
         if not session:
             raise HTTPException(503, "Сессия канала перезапускается")
-        # Долгий первый запуск тоже считается активным запросом клиента.
         session["last_access_monotonic"] = time.monotonic()
         cleanup_channel_cache(stream_id)
-        playlist_entries = session.get("playlist_entries", [])
-        if playlist_entries:
-            # Отодвигаем live edge на заданную величину, но не ждём скачивания
-            # всех сегментов: достаточно трёх уже готовых сегментов до этой границы.
-            removed_duration = 0.0
-            cutoff_sequence = None
-            for entry in reversed(playlist_entries):
-                removed_duration += entry["duration"]
-                if removed_duration >= settings.default_buffer_seconds:
-                    cutoff_sequence = entry["sequence"]
-                    break
-            if cutoff_sequence is not None:
-                cached = session.get("cached_segments", {})
-                visible = [
-                    (sequence, item)
-                    for sequence, item in sorted(cached.items())
-                    if sequence < cutoff_sequence and Path(item["path"]).is_file()
-                ]
-                if len(visible) >= 2:
-                    break
-
+        output = delayed_playlist(
+            session.get("playlist_header", []),
+            session.get("playlist_entries", []),
+            session.get("cached_segments", {}),
+            settings.default_buffer_seconds,
+            settings.hls_cache_seconds,
+            time.time(),
+            stream_id,
+        )
+        if output:
+            return PlainTextResponse(
+                output,
+                media_type="application/vnd.apple.mpegurl",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+            )
         if time.monotonic() >= deadline:
             error = session.get("last_error")
-            detail = f"Буфер {settings.default_buffer_seconds} сек. не готов за 45 секунд"
+            detail = (
+                f"Буфер {settings.default_buffer_seconds} сек. не сформирован за 60 секунд; "
+                f"готовых сегментов: {len(session.get('cached_segments', {}))}"
+            )
             if error:
-                detail += f": {error}"
+                detail += f"; последняя ошибка: {error}"
             raise HTTPException(503, detail)
         await asyncio.sleep(0.5)
-
-    first_sequence = visible[0][0]
-    output = []
-    media_sequence_written = False
-    for line in session.get("playlist_header", []):
-        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-            output.append(f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
-            media_sequence_written = True
-        else:
-            output.append(line)
-    if not media_sequence_written:
-        output.insert(1 if output else 0, f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
-
-    for sequence, item in visible:
-        output.extend((item["extinf"], f"/live/{stream_id}/segment/{sequence}.ts"))
-
-    return PlainTextResponse(
-        "\n".join(output) + "\n",
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "no-store"},
-    )
 
 
 @app.post("/live/{stream_id}/keepalive")

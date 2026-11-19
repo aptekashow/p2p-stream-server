@@ -169,7 +169,13 @@ def cleanup_all_channel_caches():
             except OSError:
                 pass
         try:
-            if not any(directory.iterdir()):
+            # Не удалять пустую папку активного канала: фоновый загрузчик
+            # продолжает писать в неё следующие сегменты.
+            try:
+                stream_id = int(directory.name)
+            except ValueError:
+                stream_id = None
+            if stream_id not in ACTIVE_STREAMS and not any(directory.iterdir()):
                 directory.rmdir()
         except OSError:
             pass

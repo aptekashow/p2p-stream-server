@@ -4,7 +4,7 @@ class Settings(BaseSettings):
     app_port: int = 9999
     acestream_base_url: str = "http://127.0.0.1:6878"
     database_url: str = "sqlite:///./data/p2p_streams.db"
-    default_buffer_seconds: int = 30
+    default_buffer_seconds: int = 15
     hls_segment_seconds: int = 4
     hls_playlist_segments: int = 10
     hls_cache_seconds: int = 300

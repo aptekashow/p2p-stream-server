@@ -6,6 +6,6 @@ services:
     network_mode: host
     env_file: .env
     environment:
-      DEFAULT_BUFFER_SECONDS: "15"
+      DEFAULT_BUFFER_SECONDS: "10"
     volumes:
       - ./data:/app/data

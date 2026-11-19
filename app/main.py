@@ -329,12 +329,21 @@ async def cache_stream_loop(stream_id: int, session: dict):
                         "cached_at": time.time(),
                     }
 
-                tasks = [asyncio.create_task(download_segment(segment)) for segment in parsed.segments]
+                # Сначала забираем самые новые сегменты: старые элементы скользящего
+                # окна Engine могут уже исчезнуть и не должны блокировать весь канал.
+                tasks = [
+                    asyncio.create_task(download_segment(segment))
+                    for segment in reversed(parsed.segments)
+                ]
+                download_errors = []
                 try:
                     for completed in asyncio.as_completed(tasks):
-                        item = await completed
-                        if item:
-                            session["cached_segments"][item[0]] = item[1]
+                        try:
+                            item = await completed
+                            if item:
+                                session["cached_segments"][item[0]] = item[1]
+                        except Exception as download_exc:
+                            download_errors.append(str(download_exc))
                 finally:
                     for task in tasks:
                         if not task.done():
@@ -342,6 +351,10 @@ async def cache_stream_loop(stream_id: int, session: dict):
                     await asyncio.gather(*tasks, return_exceptions=True)
 
                 newest = parsed.segments[-1]
+                newest_cached = session.get("cached_segments", {}).get(newest.sequence)
+                if not newest_cached or newest_cached.get("source_url") != newest.uri:
+                    detail = download_errors[0] if download_errors else "последний сегмент ещё не доступен"
+                    raise RuntimeError(f"Не удалось получить новый HLS-сегмент: {detail}")
                 newest_signature = f"{newest.sequence}|{newest.uri}"
                 if session.get("last_segment_signature") != newest_signature:
                     session["last_segment_signature"] = newest_signature

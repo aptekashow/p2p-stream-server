@@ -25,7 +25,7 @@ async def lifespan(app):
 
 app = FastAPI(
     title="P2P Stream Server",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -114,7 +114,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </head>
 <body>
 <h1>P2P Stream Server</h1>
-<p class="small">AceStream → HLS · Ubuntu 24.04 · v0.2.0</p>
+<p class="small">AceStream → HLS · задержка {settings.default_buffer_seconds} сек. · Ubuntu 24.04 · v0.3.0</p>
 
 <section>
 <h2>Каталог каналов</h2>
@@ -355,7 +355,7 @@ async def live_playlist(stream_id: int):
         keep_count -= 1
         removed_duration += entries[keep_count][2]
     if removed_duration < settings.default_buffer_seconds:
-        raise HTTPException(503, "Ожидание накопления 20-секундного буфера")
+        raise HTTPException(503, f"Ожидание накопления {settings.default_buffer_seconds}-секундного буфера")
 
     kept_entries = entries[:keep_count]
     first_sequence = kept_entries[0][1]

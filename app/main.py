@@ -23,6 +23,7 @@ ACTIVE_STREAMS = {}
 STREAM_LOCKS = {}
 CACHE_TASKS = {}
 CACHE_CLEANUP_TASK = None
+SEGMENT_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(8)
 
 
 def stream_lock(stream_id: int):
@@ -48,6 +49,8 @@ async def create_stream_session(stream_id: int, infohash: str):
         "segments": {},
         "cached_segments": {},
         "playlist_header": [],
+        "playlist_entries": [],
+        "consecutive_errors": 0,
         "recoveries": recoveries,
     }
     return result
@@ -58,6 +61,10 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         current = ACTIVE_STREAMS.get(stream_id)
         if current is not failed_session:
             return current
+        try:
+            await ace.stop_session(failed_session.get("command_url"))
+        except Exception:
+            pass
         result = await ace.start_hls(failed_session["infohash"])
         response_data = result.get("response") or {}
         playback_url = response_data.get("playback_url")
@@ -69,6 +76,7 @@ async def recover_stream_session(stream_id: int, failed_session: dict):
         failed_session["last_error"] = None
         failed_session["segments"] = {}
         failed_session["playlist_header"] = []
+        failed_session["playlist_entries"] = []
         failed_session["recoveries"] = failed_session.get("recoveries", 0) + 1
         return failed_session
 
@@ -160,10 +168,14 @@ async def cache_cleanup_loop():
 async def cache_stream_loop(stream_id: int, session: dict):
     directory = CACHE_ROOT / str(stream_id)
     directory.mkdir(parents=True, exist_ok=True)
-    while ACTIVE_STREAMS.get(stream_id) is session:
-        cleanup_channel_cache(stream_id)
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
+    failures = 0
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0, connect=8.0),
+        limits=httpx.Limits(max_connections=12, max_keepalive_connections=8),
+    ) as client:
+        while ACTIVE_STREAMS.get(stream_id) is session:
+            cleanup_channel_cache(stream_id)
+            try:
                 response = await client.get(session["playback_url"])
                 response.raise_for_status()
                 header, entries, pending_extinf = [], [], None
@@ -178,62 +190,79 @@ async def cache_stream_loop(stream_id: int, session: dict):
                             header.append(line)
                     elif pending_extinf:
                         source_url = urljoin(session["playback_url"], line)
-                        match = re.search(r"/(\d+)\.ts$", urlparse(source_url).path)
+                        match = re.search(r"/(\\d+)\\.ts$", urlparse(source_url).path)
                         if not match:
+                            pending_extinf = None
                             continue
                         duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)
                         duration = float(duration_match.group(1)) if duration_match else 0.0
                         entries.append((int(match.group(1)), pending_extinf, duration, source_url))
                         pending_extinf = None
-                if entries:
-                    session["playlist_header"] = header
-                    session["last_cache_update"] = time.time()
-                    session["last_error"] = None
-                    semaphore = asyncio.Semaphore(4)
 
-                    async def download_entry(entry):
-                        sequence, extinf, duration, source_url = entry
-                        digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
-                        path = directory / f"{sequence}-{digest}.ts"
-                        cached = session.setdefault("cached_segments", {}).get(sequence)
-                        if (
-                            cached
-                            and cached.get("source_url") == source_url
-                            and Path(cached["path"]).is_file()
-                        ):
-                            return None
-                        async with semaphore:
-                            segment_response = await client.get(source_url)
-                            segment_response.raise_for_status()
-                            temporary = path.with_suffix(".ts.tmp")
-                            await asyncio.to_thread(temporary.write_bytes, segment_response.content)
-                            await asyncio.to_thread(temporary.replace, path)
-                        return sequence, {
-                            "path": str(path),
-                            "extinf": extinf,
-                            "duration": duration,
-                            "source_url": source_url,
-                            "cached_at": time.time(),
-                        }
+                if not entries:
+                    raise RuntimeError("AceStream вернул пустой HLS-плейлист")
 
-                    results = await asyncio.gather(
-                        *(download_entry(entry) for entry in entries),
-                        return_exceptions=True,
-                    )
-                    cached_segments = session.setdefault("cached_segments", {})
-                    for result in results:
-                        if isinstance(result, tuple):
-                            cached_segments[result[0]] = result[1]
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            session["last_error"] = str(exc)
-            try:
-                await recover_stream_session(stream_id, session)
-            except Exception as recovery_exc:
-                session["last_error"] = str(recovery_exc)
-        cleanup_channel_cache(stream_id)
-        await asyncio.sleep(settings.hls_cache_poll_seconds)
+                session["playlist_header"] = header
+                session["playlist_entries"] = [
+                    {"sequence": seq, "extinf": extinf, "duration": duration}
+                    for seq, extinf, duration, _ in entries
+                ]
+                session["last_cache_update"] = time.time()
+                semaphore = asyncio.Semaphore(2)
+
+                async def download_entry(entry):
+                    sequence, extinf, duration, source_url = entry
+                    digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
+                    path = directory / f"{sequence}-{digest}.ts"
+                    cached = session.setdefault("cached_segments", {}).get(sequence)
+                    if cached and cached.get("source_url") == source_url and Path(cached["path"]).is_file():
+                        return None
+                    async with semaphore, SEGMENT_DOWNLOAD_SEMAPHORE:
+                        segment_response = await client.get(source_url)
+                        segment_response.raise_for_status()
+                        temporary = path.with_suffix(".ts.tmp")
+                        await asyncio.to_thread(temporary.write_bytes, segment_response.content)
+                        await asyncio.to_thread(temporary.replace, path)
+                    return sequence, {
+                        "path": str(path),
+                        "extinf": extinf,
+                        "duration": duration,
+                        "source_url": source_url,
+                        "cached_at": time.time(),
+                    }
+
+                tasks = [asyncio.create_task(download_entry(entry)) for entry in entries]
+                try:
+                    for completed in asyncio.as_completed(tasks):
+                        result = await completed
+                        if result:
+                            session.setdefault("cached_segments", {})[result[0]] = result[1]
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                failures = 0
+                session["consecutive_errors"] = 0
+                session["last_error"] = None
+                delay = settings.hls_cache_poll_seconds
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                session["consecutive_errors"] = failures
+                session["last_error"] = str(exc)
+                delay = min(30, 2 ** min(failures, 5))
+                if failures >= 4:
+                    try:
+                        await recover_stream_session(stream_id, session)
+                        failures = 0
+                        session["consecutive_errors"] = 0
+                    except Exception as recovery_exc:
+                        session["last_error"] = f"{exc}; восстановление: {recovery_exc}"
+            cleanup_channel_cache(stream_id)
+            await asyncio.sleep(delay)
 
 
 @asynccontextmanager
@@ -370,15 +399,6 @@ button.danger{background:#b42332}
 </section>
 
 <section>
-<h2>Поиск в P2P-сети AceStream</h2>
-<form id="engine-search-form">
-<input id="engine-q" placeholder="Название трансляции" required>
-<button type="submit">Искать в P2P</button>
-</form>
-<div id="engine-search-results" class="small">Введите название для поиска в сети AceStream.</div>
-</section>
-
-<section>
 <h2>Поиск в своём каталоге</h2>
 <form id="f">
 <input id="q" placeholder="Название канала или часть названия" required>
@@ -489,58 +509,6 @@ document.querySelector('#f').onsubmit=async e=>{
     }
 };
 
-async function addFoundChannel(index){
-    const item=window.engineSearchResults?.[index];
-    if(!item) return;
-    const out=document.querySelector('#engine-search-results');
-    try{
-        const r=await fetch('/api/streams/import',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({
-                infohash:item.infohash,
-                name:item.name,
-                categories:item.categories || [],
-                availability:item.availability || 0,
-                status:item.status || 0
-            })
-        });
-        const data=await r.json();
-        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
-        out.textContent='Добавлено в каталог: '+item.name;
-    }catch(e){
-        out.textContent='Ошибка добавления: '+e;
-    }
-}
-
-document.querySelector('#engine-search-form').onsubmit=async e=>{
-    e.preventDefault();
-    const out=document.querySelector('#engine-search-results');
-    out.textContent='Ищем трансляции в P2P-сети...';
-    try{
-        const params=new URLSearchParams({
-            q:document.querySelector('#engine-q').value,
-            page:'0',
-            page_size:'50'
-        });
-        const r=await fetch('/api/engine/search?'+params);
-        const data=await r.json();
-        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
-        window.engineSearchResults=data.results || [];
-        if(!window.engineSearchResults.length){
-            out.textContent='В P2P-сети ничего не найдено.';
-            return;
-        }
-        out.innerHTML='<p>Найдено: '+data.total+'</p>'+window.engineSearchResults.map((item,i)=>
-            '<div class="stream-item"><strong>'+escapeHtml(item.name)+'</strong>'+
-            '<div class="small">Доступность: '+Math.round((item.availability || 0)*100)+'% · статус: '+item.status+
-            ' · '+escapeHtml((item.categories || []).join(', '))+'</div>'+
-            '<div class="stream-actions"><button type="button" onclick="addFoundChannel('+i+')">Добавить в каталог</button></div></div>'
-        ).join('');
-    }catch(e){
-        out.textContent='Ошибка поиска: '+e;
-    }
-};
 
 document.querySelector('#refresh-streams').onclick=loadActiveStreams;
 health();
@@ -557,45 +525,6 @@ async def health():
         return {"ok": True, "engine": await ace.health()}
     except Exception as exc:
         return {"ok": False, "engine_error": str(exc)}
-
-
-@app.get("/api/engine/search")
-async def engine_search(
-    q: str = Query(min_length=1, max_length=200),
-    page: int = Query(0, ge=0),
-    page_size: int = Query(50, ge=1, le=200),
-):
-    try:
-        payload = await ace.search(q.strip(), page=page, page_size=page_size)
-        result = payload.get("result") or payload
-        groups = result.get("results", [])
-        found = []
-        for group in groups:
-            items = group.get("items") if isinstance(group, dict) else None
-            candidates = items if isinstance(items, list) else [group]
-            for item in candidates:
-                if not isinstance(item, dict) or not re.fullmatch(
-                    r"[a-fA-F0-9]{40}", str(item.get("infohash", ""))
-                ):
-                    continue
-                found.append({
-                    "infohash": item["infohash"].lower(),
-                    "name": item.get("name") or group.get("name") or "Без названия",
-                    "categories": item.get("categories") or [],
-                    "availability": item.get("availability") or 0,
-                    "status": item.get("status") or 0,
-                })
-        return {
-            "query": q,
-            "total": result.get("total", len(found)),
-            "page": page,
-            "page_size": page_size,
-            "results": found,
-        }
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Ошибка обращения к поиску AceStream: {exc}")
-    except Exception as exc:
-        raise HTTPException(502, f"Ошибка поиска AceStream: {exc}")
 
 
 @app.post("/api/catalog/import")
@@ -804,35 +733,40 @@ async def live_playlist(stream_id: int):
     except Exception as exc:
         raise HTTPException(502, f"Не удалось автоматически запустить канал: {exc}")
 
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 45
     while True:
         session = ACTIVE_STREAMS.get(stream_id)
         if not session:
             raise HTTPException(503, "Сессия канала перезапускается")
 
         cleanup_channel_cache(stream_id)
-        cached = session.get("cached_segments", {})
-        entries = [
-            (sequence, item)
-            for sequence, item in sorted(cached.items())
-            if Path(item["path"]).is_file()
-        ]
-
-        # Сохраняем задержку относительно live edge, пока кэш накапливается.
-        visible = list(entries)
-        removed_duration = 0.0
-        while len(visible) > 3 and removed_duration < settings.default_buffer_seconds:
-            _, newest = visible.pop()
-            removed_duration += newest["duration"]
-
-        if len(visible) >= 3 and removed_duration >= settings.default_buffer_seconds:
-            break
+        playlist_entries = session.get("playlist_entries", [])
+        if playlist_entries:
+            # Отодвигаем live edge на заданную величину, но не ждём скачивания
+            # всех сегментов: достаточно трёх уже готовых сегментов до этой границы.
+            removed_duration = 0.0
+            cutoff_sequence = None
+            for entry in reversed(playlist_entries):
+                removed_duration += entry["duration"]
+                if removed_duration >= settings.default_buffer_seconds:
+                    cutoff_sequence = entry["sequence"]
+                    break
+            if cutoff_sequence is not None:
+                cached = session.get("cached_segments", {})
+                visible = [
+                    (sequence, item)
+                    for sequence, item in sorted(cached.items())
+                    if sequence < cutoff_sequence and Path(item["path"]).is_file()
+                ]
+                if len(visible) >= 3:
+                    break
 
         if time.monotonic() >= deadline:
-            raise HTTPException(
-                503,
-                f"Буфер {settings.default_buffer_seconds} сек. не готов за 30 секунд; повторите запрос",
-            )
+            error = session.get("last_error")
+            detail = f"Буфер {settings.default_buffer_seconds} сек. не готов за 45 секунд"
+            if error:
+                detail += f": {error}"
+            raise HTTPException(503, detail)
         await asyncio.sleep(0.5)
 
     first_sequence = visible[0][0]

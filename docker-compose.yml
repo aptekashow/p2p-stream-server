@@ -1,0 +1,12 @@
+services:
+  p2p-stream-server:
+    build: .
+    container_name: p2p-stream-server
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${APP_PORT:-9999}:9999"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data

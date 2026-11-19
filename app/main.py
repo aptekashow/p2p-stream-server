@@ -383,7 +383,9 @@ async function loadActiveStreams(){
         out.innerHTML=data.map(item=>{
             const state=item.status==='running'
                 ? '<span class="status-ok">Работает</span>'
-                : '<span class="status-error">Проблема</span>';
+                : item.status==='recovering'
+                    ? '<span class="status-error">Восстанавливается</span>'
+                    : '<span class="status-error">Ошибка</span>';
             const stats=item.peers===null ? 'статистика недоступна'
                 : 'пиров: '+item.peers+' · ↓ '+item.speed_down+' КБ/с · ↑ '+item.speed_up+' КБ/с';
             const error=item.last_error
@@ -614,7 +616,7 @@ async def streams_status():
         active.append({
             "id": stream_id,
             "name": row["name"],
-            "status": "running" if task and not task.done() else "error",
+            "status": ("recovering" if session.get("last_error") else "running") if task and not task.done() else "error",
             "peers": stats.get("peers"),
             "speed_down": stats.get("speed_down", 0),
             "speed_up": stats.get("speed_up", 0),
@@ -654,6 +656,12 @@ async def start_stream(stream_id: int):
         row = db.execute("SELECT infohash FROM streams WHERE id=?", (stream_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Канал не найден")
+    existing = ACTIVE_STREAMS.get(stream_id)
+    if existing:
+        task = CACHE_TASKS.get(stream_id)
+        if task and not task.done():
+            return {"already_running": True, "stream_url": f"/live/{stream_id}/index.m3u8"}
+        await stop_stream_session(stream_id)
     try:
         async with stream_lock(stream_id):
             result = await create_stream_session(stream_id, row["infohash"])

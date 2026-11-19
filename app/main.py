@@ -2,8 +2,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import re
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+import httpx
+
+from app.config import settings
 from pydantic import BaseModel, Field
 
 from app.acestream import AceStreamClient
@@ -11,6 +14,7 @@ from app.db import connect, init_db
 
 ace = AceStreamClient()
 PLAYLIST_PATH = Path("/app/data/ace-stream-playlist.m3u8")
+ACTIVE_STREAMS = {}
 
 
 @asynccontextmanager
@@ -275,7 +279,7 @@ async def list_streams():
 
 
 @app.get("/playlist.m3u", response_class=PlainTextResponse)
-async def playlist():
+async def playlist(request: Request):
     with connect() as db:
         rows = db.execute(
             "SELECT id,name FROM streams ORDER BY name COLLATE NOCASE"
@@ -286,7 +290,7 @@ async def playlist():
     for row in rows:
         lines += [
             f"#EXTINF:-1,{row['name']}",
-            f"http://SERVER_IP:9999/live/{row['id']}/index.m3u8",
+            f"{str(request.base_url).rstrip('/')}/live/{row['id']}/index.m3u8",
         ]
 
     return "\n".join(lines) + "\n"
@@ -295,15 +299,96 @@ async def playlist():
 @app.post("/api/streams/{stream_id}/start")
 async def start_stream(stream_id: int):
     with connect() as db:
-        row = db.execute(
-            "SELECT infohash FROM streams WHERE id=?",
-            (stream_id,),
-        ).fetchone()
-
+        row = db.execute("SELECT infohash FROM streams WHERE id=?", (stream_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Канал не найден")
-
     try:
-        return await ace.start_hls(row["infohash"])
+        result = await ace.start_hls(row["infohash"])
+        playback_url = (result.get("response") or {}).get("playback_url")
+        if not playback_url:
+            raise HTTPException(502, f"AceStream не вернул playback_url: {result}")
+        ACTIVE_STREAMS[stream_id] = {"infohash": row["infohash"], "playback_url": playback_url, "segments": {}}
+        return {**result, "stream_url": f"/live/{stream_id}/index.m3u8"}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(502, f"Не удалось запустить AceStream: {exc}")
+
+
+@app.get("/live/{stream_id}/index.m3u8", response_class=PlainTextResponse)
+async def live_playlist(stream_id: int):
+    session = ACTIVE_STREAMS.get(stream_id)
+    if not session:
+        raise HTTPException(404, "Поток не запущен. Сначала вызовите POST /api/streams/{id}/start")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            upstream = await client.get(session["playback_url"])
+            upstream.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Ошибка получения HLS-плейлиста AceStream: {exc}")
+
+    header, entries, pending_extinf = [], [], None
+    for raw_line in upstream.text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            pending_extinf = line
+        elif line.startswith("#"):
+            if not entries:
+                header.append(line)
+        elif pending_extinf:
+            match = re.search(r"^(?:https?://[^/]+)?/hls/c/.+/(\d+)\.ts(?:\?.*)?$", line)
+            if not match:
+                raise HTTPException(502, f"Неизвестный адрес HLS-сегмента: {line}")
+            sequence = int(match.group(1))
+            duration_match = re.search(r"#EXTINF:([0-9.]+)", pending_extinf)
+            duration = float(duration_match.group(1)) if duration_match else 0.0
+            entries.append((pending_extinf, sequence, duration, line))
+            pending_extinf = None
+
+    if len(entries) < 3:
+        raise HTTPException(503, "AceStream пока не подготовил достаточно HLS-сегментов")
+
+    removed_duration, keep_count = 0.0, len(entries)
+    while keep_count > 3 and removed_duration < settings.default_buffer_seconds:
+        keep_count -= 1
+        removed_duration += entries[keep_count][2]
+    if removed_duration < settings.default_buffer_seconds:
+        raise HTTPException(503, "Ожидание накопления 20-секундного буфера")
+
+    kept_entries = entries[:keep_count]
+    first_sequence = kept_entries[0][1]
+    session["segments"].update({seq: url for _, seq, _, url in kept_entries})
+    session["segments"] = {seq: url for seq, url in session["segments"].items() if seq >= first_sequence}
+
+    output, media_sequence_updated = [], False
+    for line in header:
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            output.append(f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
+            media_sequence_updated = True
+        else:
+            output.append(line)
+    if not media_sequence_updated:
+        output.insert(1, f"#EXT-X-MEDIA-SEQUENCE:{first_sequence}")
+    for extinf, sequence, _, _ in kept_entries:
+        output.extend((extinf, f"/live/{stream_id}/segment/{sequence}.ts"))
+
+    return PlainTextResponse("\n".join(output) + "\n", media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/live/{stream_id}/segment/{sequence}.ts")
+async def live_segment(stream_id: int, sequence: int):
+    session = ACTIVE_STREAMS.get(stream_id)
+    if not session:
+        raise HTTPException(404, "Поток не запущен")
+    upstream_url = session["segments"].get(sequence)
+    if not upstream_url:
+        raise HTTPException(404, "Сегмент устарел или отсутствует. Обновите HLS-плейлист")
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            upstream = await client.get(upstream_url)
+            upstream.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Ошибка получения HLS-сегмента AceStream: {exc}")
+    return Response(content=upstream.content, media_type="video/mp2t", headers={"Cache-Control": "no-store"})

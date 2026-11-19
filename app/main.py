@@ -394,6 +394,12 @@ button.danger{background:#b42332}
 </section>
 
 <section>
+<h2>Воспроизведение</h2>
+<video id="stream-player" controls autoplay muted playsinline style="display:none;width:100%;max-height:520px;background:#000;border-radius:10px"></video>
+<p id="player-status" class="small">Выберите канал и нажмите «Запустить».</p>
+</section>
+
+<section>
 <h2>Активные каналы</h2>
 <button id="refresh-streams" type="button">Обновить</button>
 <div id="active-streams" class="small">Активных каналов пока нет.</div>
@@ -413,7 +419,46 @@ button.danger{background:#b42332}
 <pre id="health">Проверка...</pre>
 </section>
 
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
+let activeHls = null;
+async function playStream(id){
+    const video = document.querySelector('#stream-player');
+    const status = document.querySelector('#player-status');
+    const url = '/live/'+id+'/index.m3u8';
+    video.style.display='block';
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    if(activeHls){ activeHls.destroy(); activeHls=null; }
+    video.muted=true;
+    status.textContent='Запуск потока и заполнение буфера...';
+    if(video.canPlayType('application/vnd.apple.mpegurl')){
+        video.src=url;
+        video.oncanplay=()=>video.play().then(()=>{
+            status.textContent='Воспроизведение запущено';
+        }).catch(()=>{status.textContent='Нажмите Play для начала воспроизведения';});
+        video.onerror=()=>{status.textContent='Ошибка загрузки HLS-потока';};
+    }else if(window.Hls && Hls.isSupported()){
+        activeHls=new Hls({enableWorker:true,lowLatencyMode:false,
+            manifestLoadingTimeOut:60000,manifestLoadingMaxRetry:5,
+            levelLoadingTimeOut:60000,levelLoadingMaxRetry:5,
+            fragLoadingTimeOut:60000,fragLoadingMaxRetry:6});
+        activeHls.loadSource(url);
+        activeHls.attachMedia(video);
+        activeHls.on(Hls.Events.MANIFEST_PARSED,()=>{
+            video.play().then(()=>{
+                status.textContent='Воспроизведение запущено';
+            }).catch(()=>{status.textContent='Нажмите Play для начала воспроизведения';});
+        });
+        activeHls.on(Hls.Events.ERROR,(event,data)=>{
+            if(data.fatal) status.textContent='Ошибка HLS: '+(data.details||data.type);
+        });
+    }else{
+        status.textContent='Этот браузер не поддерживает HLS';
+    }
+}
+
 function escapeHtml(value){
     return String(value ?? '').replace(/[&<>"']/g, ch => ({
         '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -427,6 +472,7 @@ async function streamAction(id, action){
         const r=await fetch('/api/streams/'+id+'/'+action,{method:'POST'});
         const data=await r.json();
         if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        if(action==='start' || action==='restart') await playStream(id);
         await loadActiveStreams();
     }catch(e){
         out.textContent='Ошибка: '+e;

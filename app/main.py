@@ -505,6 +505,17 @@ function escapeHtml(value){
 
 async function streamAction(id, action){
     const out=document.querySelector('#active-streams');
+    if((action==='start' || action==='restart') && activeStreamId !== null && Number(activeStreamId)!==Number(id)){
+        const previousId=activeStreamId;
+        stopStreamHeartbeat();
+        activeStreamId=null;
+        if(activeHls){ activeHls.destroy(); activeHls=null; }
+        const video=document.querySelector('#stream-player');
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        try{ await fetch('/api/streams/'+previousId+'/stop',{method:'POST'}); }catch(e){}
+    }
     if(action==='stop' && activeStreamId !== null && Number(activeStreamId)===Number(id)){
         stopStreamHeartbeat();
         activeStreamId=null;

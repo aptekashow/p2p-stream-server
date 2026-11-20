@@ -782,6 +782,9 @@ async def catalog_upload(request: Request):
 @app.post("/api/catalog/import")
 async def catalog_import():
     try:
+        # Старые сессии относятся к прежнему каталогу — остановить их перед заменой.
+        for stream_id in list(ACTIVE_STREAMS):
+            await stop_stream_session(stream_id)
         return import_playlist()
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc))

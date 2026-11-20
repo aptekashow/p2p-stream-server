@@ -425,56 +425,55 @@ class ImportItem(BaseModel):
     status: int = 0
 
 
+def parse_import_playlist(content: str):
+    items = []
+    invalid = 0
+    current_name = None
+    current_category = ""
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXTINF:"):
+            current_name = line.split(",", 1)[1].strip() if "," in line else None
+            group = re.search(r'group-title="([^"]*)"', line, re.IGNORECASE)
+            current_category = group.group(1).strip() if group else ""
+            continue
+        if not line or line.startswith("#"):
+            continue
+        match = re.search(r"infohash=([a-fA-F0-9]{40})", line)
+        if not match or not current_name:
+            invalid += 1
+            current_name = None
+            current_category = ""
+            continue
+        items.append((match.group(1).lower(), current_name[:300], current_category[:200], 0, 0))
+        current_name = None
+        current_category = ""
+    # Один infohash — одна запись. Последнее название в файле имеет приоритет.
+    unique = {}
+    for item in items:
+        unique[item[0]] = item
+    return list(unique.values()), invalid
+
+
 def import_playlist():
     if not PLAYLIST_PATH.is_file():
         raise FileNotFoundError(f"Файл каталога не найден: {PLAYLIST_PATH}")
-
-    content = PLAYLIST_PATH.read_text(
-        encoding="utf-8-sig",
-        errors="replace",
-    )
-
-    imported = 0
-    invalid = 0
-    current_name = None
-
+    content = PLAYLIST_PATH.read_text(encoding="utf-8-sig", errors="replace")
+    items, invalid = parse_import_playlist(content)
+    if not items:
+        raise ValueError("В плейлисте не найдено ни одного корректного AceStream infohash")
     with connect() as db:
-        for line in content.splitlines():
-            line = line.strip()
-
-            if line.startswith("#EXTINF:"):
-                current_name = line.split(",", 1)[1].strip() if "," in line else None
-                continue
-
-            if not line or line.startswith("#"):
-                continue
-
-            match = re.search(r"infohash=([a-fA-F0-9]{40})", line)
-
-            if not match or not current_name:
-                invalid += 1
-                current_name = None
-                continue
-
-            infohash = match.group(1).lower()
-
-            db.execute(
-                """
-                INSERT INTO streams
-                    (infohash, name, categories, availability, status)
-                VALUES (?, ?, '', 0, 0)
-                ON CONFLICT(infohash) DO UPDATE SET
-                    name = excluded.name
-                """,
-                (infohash, current_name[:300]),
-            )
-
-            imported += 1
-            current_name = None
-
+        previous = db.execute("SELECT COUNT(*) FROM streams").fetchone()[0]
+        db.execute("DELETE FROM streams")
+        db.executemany(
+            "INSERT INTO streams(infohash,name,categories,availability,status) VALUES(?,?,?,?,?)",
+            items,
+        )
     return {
         "ok": True,
-        "imported": imported,
+        "mode": "replace",
+        "deleted": previous,
+        "imported": len(items),
         "invalid": invalid,
         "source": PLAYLIST_PATH.name,
     }
@@ -513,10 +512,12 @@ button.danger{background:#b42332}
 <section>
 <h2>Каталог каналов</h2>
 <div class="stream-actions">
-<button id="import">Импортировать каталог</button>
+<input id="playlist-file" type="file" accept=".m3u,.m3u8,audio/x-mpegurl,application/vnd.apple.mpegurl">
+<button id="upload-playlist" type="button">Загрузить новый плейлист</button>
+<button id="import">Заменить каталог каналов</button>
 <a href="/playlist.m3u" download="p2p-stream-playlist.m3u" style="display:inline-block;padding:12px;border-radius:8px;background:#334155;color:white;text-decoration:none">Скачать весь плейлист</a>
 </div>
-<p id="import-result" class="small">Каталог ещё не импортирован.</p>
+<p id="import-result" class="small">Выберите новый M3U-файл, загрузите его, затем нажмите «Заменить каталог каналов».</p>
 </section>
 
 <section>
@@ -693,6 +694,19 @@ async function health(){
     }
 }
 
+document.querySelector('#upload-playlist').onclick=async()=>{
+    const file=document.querySelector('#playlist-file').files[0];
+    const out=document.querySelector('#import-result');
+    if(!file){out.textContent='Сначала выберите файл M3U.';return;}
+    out.textContent='Загрузка нового плейлиста...';
+    try{
+        const r=await fetch('/api/catalog/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
+        const data=await r.json();
+        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
+        out.textContent='Плейлист загружен: '+data.uploaded+' каналов. Теперь нажмите «Заменить каталог каналов».';
+    }catch(e){out.textContent='Ошибка загрузки: '+e;}
+};
+
 document.querySelector('#import').onclick=async()=>{
     let out=document.querySelector('#import-result');
     out.textContent='Импорт выполняется...';
@@ -745,6 +759,24 @@ async def health():
         return {"ok": True, "engine": await ace.health()}
     except Exception as exc:
         return {"ok": False, "engine_error": str(exc)}
+
+
+@app.post("/api/catalog/upload")
+async def catalog_upload(request: Request):
+    body = await request.body()
+    if len(body) > 5 * 1024 * 1024:
+        raise HTTPException(413, "Плейлист больше 5 МБ")
+    content = body.decode("utf-8-sig", errors="replace")
+    if "#EXTM3U" not in content[:500] or not re.search(r"infohash=[a-fA-F0-9]{40}", content):
+        raise HTTPException(400, "Файл не похож на AceStream M3U-плейлист")
+    items, invalid = parse_import_playlist(content)
+    if not items:
+        raise HTTPException(400, "В плейлисте нет корректных AceStream-каналов")
+    PLAYLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = PLAYLIST_PATH.with_suffix(PLAYLIST_PATH.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(PLAYLIST_PATH)
+    return {"ok": True, "uploaded": len(items), "invalid": invalid, "file": PLAYLIST_PATH.name}
 
 
 @app.post("/api/catalog/import")

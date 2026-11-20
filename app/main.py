@@ -518,9 +518,8 @@ button.danger{background:#b42332}
 <button id="upload-playlist" type="submit">Загрузить и заменить каталог</button>
 
 <a href="/playlist.m3u" download="p2p-stream-playlist.m3u" style="display:inline-block;padding:12px;border-radius:8px;background:#334155;color:white;text-decoration:none">Скачать весь плейлист</a>
-</div>
-<p id="import-result" class="small">Выберите M3U-файл и нажмите «Загрузить и заменить каталог». Замена выполняется автоматически.</p>
 </form>
+<p id="import-result" class="small">Выберите M3U-файл и нажмите «Загрузить и заменить каталог». Замена выполняется автоматически.</p>
 </section>
 
 <section>
@@ -697,22 +696,6 @@ async function health(){
     }
 }
 
-async function uploadPlaylist(){
-    const file=document.querySelector('#playlist-file').files[0];
-    const out=document.querySelector('#import-result');
-    out.textContent='Кнопка нажата. Подготовка файла...';
-    if(!file){out.textContent='Сначала выберите файл M3U.';return;}
-    out.textContent='Загрузка нового плейлиста: '+file.name+' ('+file.size+' байт)...';
-    try{
-        const r=await fetch('/api/catalog/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:await file.arrayBuffer()});
-        const raw=await r.text();
-        let data;
-        try{data=JSON.parse(raw);}catch(_){throw new Error('Сервер вернул не JSON (HTTP '+r.status+'): '+raw.slice(0,300));}
-        if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
-        out.textContent='ГОТОВО: каталог полностью заменён. Удалено: '+data.deleted+'; загружено: '+data.imported+'; пропущено: '+data.invalid+'.';
-        document.querySelector('#playlist-file').value='';
-    }catch(e){out.textContent='ОШИБКА: '+(e.message||e);}
-}
 
 document.querySelector('#f').onsubmit=async e=>{
     e.preventDefault();
@@ -812,7 +795,7 @@ async def catalog_upload(request: Request):
         "<title>Каталог заменён</title>"
         "<body style='font:16px system-ui;background:#10151f;color:#e8edf5;max-width:700px;margin:60px auto;padding:20px'>"
         "<h1>Каталог успешно заменён</h1>"
-        f"<p>Файл: {filename}</p>"
+        "<p>M3U-файл принят и обработан.</p>"
         f"<p>Удалено старых каналов: {previous}</p>"
         f"<p>Загружено каналов: {len(items)}</p>"
         f"<p>Пропущено строк: {invalid}</p>"

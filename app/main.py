@@ -513,7 +513,7 @@ button.danger{background:#b42332}
 <h2>Каталог каналов</h2>
 <div class="stream-actions">
 <input id="playlist-file" type="file" accept=".m3u,.m3u8,audio/x-mpegurl,application/vnd.apple.mpegurl">
-<button id="upload-playlist" type="button">Загрузить и заменить каталог</button>
+<button id="upload-playlist" type="button" onclick="uploadPlaylist()">Загрузить и заменить каталог</button>
 
 <a href="/playlist.m3u" download="p2p-stream-playlist.m3u" style="display:inline-block;padding:12px;border-radius:8px;background:#334155;color:white;text-decoration:none">Скачать весь плейлист</a>
 </div>
@@ -694,11 +694,12 @@ async function health(){
     }
 }
 
-document.querySelector('#upload-playlist').onclick=async()=>{
+async function uploadPlaylist(){
     const file=document.querySelector('#playlist-file').files[0];
     const out=document.querySelector('#import-result');
+    out.textContent='Кнопка нажата. Подготовка файла...';
     if(!file){out.textContent='Сначала выберите файл M3U.';return;}
-    out.textContent='Загрузка нового плейлиста...';
+    out.textContent='Загрузка нового плейлиста: '+file.name+' ('+file.size+' байт)...';
     try{
         const r=await fetch('/api/catalog/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:await file.arrayBuffer()});
         const raw=await r.text();
@@ -708,7 +709,7 @@ document.querySelector('#upload-playlist').onclick=async()=>{
         out.textContent='ГОТОВО: каталог полностью заменён. Удалено: '+data.deleted+'; загружено: '+data.imported+'; пропущено: '+data.invalid+'.';
         document.querySelector('#playlist-file').value='';
     }catch(e){out.textContent='ОШИБКА: '+(e.message||e);}
-};
+}
 
 document.querySelector('#f').onsubmit=async e=>{
     e.preventDefault();

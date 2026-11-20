@@ -513,11 +513,11 @@ button.danger{background:#b42332}
 <h2>Каталог каналов</h2>
 <div class="stream-actions">
 <input id="playlist-file" type="file" accept=".m3u,.m3u8,audio/x-mpegurl,application/vnd.apple.mpegurl">
-<button id="upload-playlist" type="button">Загрузить новый плейлист</button>
-<button id="import">Заменить каталог каналов</button>
+<button id="upload-playlist" type="button">Загрузить и заменить каталог</button>
+
 <a href="/playlist.m3u" download="p2p-stream-playlist.m3u" style="display:inline-block;padding:12px;border-radius:8px;background:#334155;color:white;text-decoration:none">Скачать весь плейлист</a>
 </div>
-<p id="import-result" class="small">Выберите новый M3U-файл, загрузите его, затем нажмите «Заменить каталог каналов».</p>
+<p id="import-result" class="small">Выберите M3U-файл и нажмите «Загрузить и заменить каталог». Замена выполняется автоматически.</p>
 </section>
 
 <section>
@@ -700,11 +700,14 @@ document.querySelector('#upload-playlist').onclick=async()=>{
     if(!file){out.textContent='Сначала выберите файл M3U.';return;}
     out.textContent='Загрузка нового плейлиста...';
     try{
-        const r=await fetch('/api/catalog/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
-        const data=await r.json();
+        const r=await fetch('/api/catalog/upload',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:await file.arrayBuffer()});
+        const raw=await r.text();
+        let data;
+        try{data=JSON.parse(raw);}catch(_){throw new Error('Сервер вернул не JSON (HTTP '+r.status+'): '+raw.slice(0,300));}
         if(!r.ok) throw new Error(data.detail || JSON.stringify(data));
-        out.textContent='Плейлист загружен: '+data.uploaded+' каналов. Теперь нажмите «Заменить каталог каналов».';
-    }catch(e){out.textContent='Ошибка загрузки: '+e;}
+        out.textContent='ГОТОВО: каталог полностью заменён. Удалено: '+data.deleted+'; загружено: '+data.imported+'; пропущено: '+data.invalid+'.';
+        document.querySelector('#playlist-file').value='';
+    }catch(e){out.textContent='ОШИБКА: '+(e.message||e);}
 };
 
 document.querySelector('#import').onclick=async()=>{
@@ -776,7 +779,22 @@ async def catalog_upload(request: Request):
     temporary = PLAYLIST_PATH.with_suffix(PLAYLIST_PATH.suffix + ".tmp")
     temporary.write_text(content, encoding="utf-8")
     temporary.replace(PLAYLIST_PATH)
-    return {"ok": True, "uploaded": len(items), "invalid": invalid, "file": PLAYLIST_PATH.name}
+    # Загрузка и замена каталога выполняются одной операцией — без второго нажатия.
+    stopped = 0
+    for stream_id in list(ACTIVE_STREAMS):
+        await stop_stream_session(stream_id)
+        stopped += 1
+    try:
+        result = import_playlist()
+    except Exception as exc:
+        raise HTTPException(500, f"Файл сохранён, но каталог не заменён: {exc}")
+    return {
+        **result,
+        "uploaded": len(items),
+        "invalid": invalid,
+        "stopped_sessions": stopped,
+        "file": PLAYLIST_PATH.name,
+    }
 
 
 @app.post("/api/catalog/import")

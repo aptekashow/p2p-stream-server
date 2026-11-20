@@ -710,18 +710,6 @@ document.querySelector('#upload-playlist').onclick=async()=>{
     }catch(e){out.textContent='ОШИБКА: '+(e.message||e);}
 };
 
-document.querySelector('#import').onclick=async()=>{
-    let out=document.querySelector('#import-result');
-    out.textContent='Импорт выполняется...';
-    try{
-        let r=await fetch('/api/catalog/import',{method:'POST'});
-        let data=await r.json();
-        out.textContent=JSON.stringify(data,null,2);
-    }catch(e){
-        out.textContent=String(e);
-    }
-};
-
 document.querySelector('#f').onsubmit=async e=>{
     e.preventDefault();
     let out=document.querySelector('#out');

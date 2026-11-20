@@ -5,6 +5,8 @@ import re
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from email.parser import BytesParser
+from email.policy import default
 from urllib.parse import urljoin, urlparse
 import hashlib
 import time
@@ -511,13 +513,14 @@ button.danger{background:#b42332}
 
 <section>
 <h2>Каталог каналов</h2>
-<div class="stream-actions">
-<input id="playlist-file" type="file" accept=".m3u,.m3u8,audio/x-mpegurl,application/vnd.apple.mpegurl">
-<button id="upload-playlist" type="button" onclick="uploadPlaylist()">Загрузить и заменить каталог</button>
+<form class="stream-actions" method="post" action="/api/catalog/upload" enctype="multipart/form-data">
+<input id="playlist-file" name="playlist" type="file" accept=".m3u,.m3u8,audio/x-mpegurl,application/vnd.apple.mpegurl" required>
+<button id="upload-playlist" type="submit">Загрузить и заменить каталог</button>
 
 <a href="/playlist.m3u" download="p2p-stream-playlist.m3u" style="display:inline-block;padding:12px;border-radius:8px;background:#334155;color:white;text-decoration:none">Скачать весь плейлист</a>
 </div>
 <p id="import-result" class="small">Выберите M3U-файл и нажмите «Загрузить и заменить каталог». Замена выполняется автоматически.</p>
+</form>
 </section>
 
 <section>
@@ -755,36 +758,69 @@ async def health():
 
 @app.post("/api/catalog/upload")
 async def catalog_upload(request: Request):
+    """Принимает M3U через обычную multipart/form-data HTML-форму."""
+    content_type = request.headers.get("content-type", "")
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(415, "Отправьте файл через форму загрузки M3U на главной странице")
     body = await request.body()
-    if len(body) > 5 * 1024 * 1024:
+    if len(body) > 6 * 1024 * 1024:
         raise HTTPException(413, "Плейлист больше 5 МБ")
-    content = body.decode("utf-8-sig", errors="replace")
+    try:
+        message = BytesParser(policy=default).parsebytes(
+            b"Content-Type: " + content_type.encode("ascii", "ignore") +
+            b"\r\nMIME-Version: 1.0\r\n\r\n" + body
+        )
+        uploaded = None
+        filename = "playlist.m3u"
+        for part in message.iter_parts():
+            if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == "playlist":
+                uploaded = part.get_payload(decode=True)
+                filename = part.get_filename() or filename
+                break
+    except Exception as exc:
+        raise HTTPException(400, f"Не удалось прочитать загруженный файл: {exc}")
+    if not uploaded:
+        raise HTTPException(400, "Файл не выбран или он пустой")
+    content = uploaded.decode("utf-8-sig", errors="replace")
     if "#EXTM3U" not in content[:500] or not re.search(r"infohash=[a-fA-F0-9]{40}", content):
         raise HTTPException(400, "Файл не похож на AceStream M3U-плейлист")
     items, invalid = parse_import_playlist(content)
     if not items:
-        raise HTTPException(400, "В плейлисте нет корректных AceStream-каналов")
-    PLAYLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = PLAYLIST_PATH.with_suffix(PLAYLIST_PATH.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8")
-    temporary.replace(PLAYLIST_PATH)
-    # Загрузка и замена каталога выполняются одной операцией — без второго нажатия.
+        raise HTTPException(400, "В плейлисте не найдено ни одного корректного AceStream-канала")
     stopped = 0
     for stream_id in list(ACTIVE_STREAMS):
         await stop_stream_session(stream_id)
         stopped += 1
+    PLAYLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = PLAYLIST_PATH.with_suffix(PLAYLIST_PATH.suffix + ".tmp")
     try:
-        result = import_playlist()
+        temporary.write_text(content, encoding="utf-8")
+        with connect() as db:
+            previous = db.execute("SELECT COUNT(*) FROM streams").fetchone()[0]
+            db.execute("DELETE FROM streams")
+            db.executemany(
+                "INSERT INTO streams(infohash,name,categories,availability,status) VALUES(?,?,?,?,?)",
+                items,
+            )
+        temporary.replace(PLAYLIST_PATH)
     except Exception as exc:
-        raise HTTPException(500, f"Файл сохранён, но каталог не заменён: {exc}")
-    return {
-        **result,
-        "uploaded": len(items),
-        "invalid": invalid,
-        "stopped_sessions": stopped,
-        "file": PLAYLIST_PATH.name,
-    }
-
+        temporary.unlink(missing_ok=True)
+        raise HTTPException(500, f"Не удалось заменить каталог: {exc}")
+    return HTMLResponse(
+        "<!doctype html><html lang='ru'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Каталог заменён</title>"
+        "<body style='font:16px system-ui;background:#10151f;color:#e8edf5;max-width:700px;margin:60px auto;padding:20px'>"
+        "<h1>Каталог успешно заменён</h1>"
+        f"<p>Файл: {filename}</p>"
+        f"<p>Удалено старых каналов: {previous}</p>"
+        f"<p>Загружено каналов: {len(items)}</p>"
+        f"<p>Пропущено строк: {invalid}</p>"
+        f"<p>Остановлено старых трансляций: {stopped}</p>"
+        "<p><a style='color:#7db4ff' href='/'>Вернуться к каталогу</a></p>"
+        "</body></html>",
+        status_code=200,
+    )
 
 @app.post("/api/catalog/import")
 async def catalog_import():
